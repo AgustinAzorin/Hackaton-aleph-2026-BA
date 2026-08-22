@@ -93,11 +93,30 @@ Las tres decisiones de fondo:
 - **El reconocedor agrupa recortes.** Una A4 tiene entre 60 y 120 cajas de texto; reconocerlas de a una paga el costo fijo de la pasada cien veces por página.
 - **La fase 3 decodifica varias facturas a la vez.** En un modelo cuantizado la decodificación está limitada por ancho de banda de memoria: emitir un token exige recorrer los 2,5 GB de pesos, se emita para una factura o para cuatro. El bucle secuencial pagaba ese recorrido por token *y* por factura. Ahora la fase 3 son dos lotes —todas las extracciones, después todas las auditorías— con una franja de código puro en el medio que resuelve, sin modelo, los casos que no necesitan auditoría (duplicados dentro del lote, órdenes de compra citadas que no existen). Cada factura conserva su prompt, su gramática y su contexto propio: lo único compartido es el paso de decodificación.
 
-La cantidad de slots se calcula contra la RAM libre real de la máquina (`planLlm`), no se fija a ciegas: quedarse sin memoria en plena fase 3 no degrada la velocidad, tumba la corrida. Con un solo slot el comportamiento es idéntico al secuencial.
+La cantidad de slots se calcula contra la RAM libre real de la máquina (`planLlm`), no se fija a ciegas: quedarse sin memoria en plena fase 3 no degrada la velocidad, tumba la corrida. Con un solo slot el comportamiento es idéntico al secuencial — y por eso el número **tiene que ser visible**: el stream de progreso informa cuántos slots se activaron y por qué. Un batcheo que degrada a un slot en silencio se ve exactamente igual que un batcheo que no funciona.
+
+El costo real de un slot es la KV cache: 36 capas x 1024 de dimensión KV, clave y valor, son 144 KiB por token en fp16 — 576 MiB por slot de 4096. Cuatro slots así reservan 2,25 GiB **además** de los 2,5 GB de pesos, y en un portátil de 8 GB no entran. Por eso la cache va cuantizada a `q8_0` (288 MiB por slot, 1,13 GiB los cuatro): es lo que hace que el batcheo entre en la máquina objetivo. `QVAC_LLM_KV_CACHE=f16` lo desactiva; `QVAC_LLM_SLOTS=N` fuerza el paralelismo y saltea la estimación, que es la forma de medir el efecto sin depender de cuánta RAM haya libre en ese momento.
 
 La decodificación es **determinista** (`temp: 0`, `top_k: 1`, semilla fija). Muestrear con temperatura al transcribir montos de un OCR sólo agrega la chance de desviarse del token correcto — y de fallar la validación zod, que cuesta un reintento completo. Además hace que dos corridas del mismo lote sean comparables entre sí, que es la condición para poder medir cualquier cambio.
 
-El reporte informa **tiempo de reloj** y el promedio por factura derivado de él. Sumar el tiempo de cada fila contaría dos veces el tramo que las facturas comparten mientras decodifican en paralelo; por eso el total de cada fila es la suma de sus etapas amortizadas, no su reloj propio. El desglose del OCR entre detección y reconocimiento sale por el stream de progreso al terminar la fase 1.
+### Cómo se mide
+
+El reporte informa **tiempo de reloj** y el promedio por factura derivado de él. Sumar el tiempo de cada fila contaría dos veces el tramo que las facturas comparten mientras decodifican en paralelo; por eso el total de cada fila es la suma de sus etapas amortizadas, no su reloj propio.
+
+Debajo del resumen sale la tabla que decide la próxima optimización:
+
+```
+DÓNDE SE FUE EL TIEMPO
+fase                         carga trabajo descarga
+OCR_LATIN                    x.x s   x.x s    x.x s
+GTE_LARGE_FP16               x.x s   x.x s    x.x s
+QWEN3_4B_INST_Q4_K_M         x.x s   x.x s    x.x s
+(sin modelo cargado)                          x.x s
+```
+
+La separación entre **carga** y **trabajo** es la que importa: carga alta apunta a E/S (cachear los pesos, elegir un modelo más chico), trabajo alto apunta a inferencia (batchear, bajar resolución). Mirando sólo el total de la fase, las dos causas se ven idénticas. La fila sin modelo cargado es rasterización, resolución exacta de PO y verificación determinista — trabajo de CPU pura entre fases.
+
+El OCR agrega su propio desglose entre detección y reconocimiento por el stream de progreso al terminar la fase 1, porque son dos perillas distintas.
 
 ## Cómo funciona
 

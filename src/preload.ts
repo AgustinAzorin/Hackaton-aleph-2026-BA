@@ -11,7 +11,7 @@
  */
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import type { ProgressEvent } from './services/qvacService.js'
-import type { ReconciliationVerdict } from './types.js'
+import type { PhaseTiming, ReconciliationVerdict } from './types.js'
 
 export interface PipelineRequest {
   invoicesDir: string
@@ -19,7 +19,7 @@ export interface PipelineRequest {
 }
 
 export type PipelineResponse =
-  | { ok: true; verdicts: ReconciliationVerdict[]; elapsedMs: number }
+  | { ok: true; verdicts: ReconciliationVerdict[]; phases: PhaseTiming[]; elapsedMs: number }
   | { ok: false; error: string }
 
 export interface ReconcilerApi {

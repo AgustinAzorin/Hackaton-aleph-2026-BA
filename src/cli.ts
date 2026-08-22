@@ -10,7 +10,7 @@
  */
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { ReconciliationVerdict, Verdict } from './types.js'
+import type { PhaseTiming, ReconciliationVerdict, Verdict } from './types.js'
 import { reconcileFolders, shutdown, type ProgressEvent } from './services/qvacService.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -50,7 +50,39 @@ function formatProgress(event: ProgressEvent): string {
   return paint('dim', `[${timestamp}] ${event.stage.padEnd(7)} ${event.message}${counter}`)
 }
 
-function printReport(verdicts: ReconciliationVerdict[], elapsedMs: number): void {
+/**
+ * Dónde se fue el tiempo, por fase y separando carga de trabajo.
+ *
+ * Es el tablero que decide la próxima optimización: `carga` alta apunta a E/S
+ * (cachear los pesos, elegir un modelo más chico), `trabajo` alto apunta a
+ * inferencia (batchear, bajar resolución). Mirando sólo el total, las dos se
+ * ven igual.
+ */
+function printPhases(phases: PhaseTiming[], elapsedMs: number): void {
+  if (phases.length === 0) return
+
+  const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`.padStart(8)
+  const accounted = phases.reduce((sum, p) => sum + p.loadMs + p.workMs + p.unloadMs, 0)
+
+  console.log(`\n${paint('bold', 'DÓNDE SE FUE EL TIEMPO')}`)
+  console.log(paint('dim', `${'fase'.padEnd(26)}${'carga'.padStart(8)}${'trabajo'.padStart(8)}${'descarga'.padStart(9)}`))
+  for (const phase of phases) {
+    console.log(
+      `${phase.phase.padEnd(26)}${secs(phase.loadMs)}${secs(phase.workMs)}${secs(phase.unloadMs).padStart(9)}`
+    )
+  }
+  // Lo que queda fuera de las fases es trabajo sin ningún modelo cargado:
+  // rasterización, resolución exacta de PO, verificación determinista.
+  console.log(
+    paint('dim', `${'(sin modelo cargado)'.padEnd(26)}${' '.repeat(16)}${secs(elapsedMs - accounted).padStart(9)}`)
+  )
+}
+
+function printReport(
+  verdicts: ReconciliationVerdict[],
+  phases: PhaseTiming[],
+  elapsedMs: number
+): void {
   console.log(`\n${paint('bold', '═'.repeat(78))}`)
   console.log(paint('bold', 'REPORTE DE RECONCILIACIÓN'))
   console.log(paint('bold', '═'.repeat(78)))
@@ -112,6 +144,7 @@ function printReport(verdicts: ReconciliationVerdict[], elapsedMs: number): void
   // sumar filas: bajo decodificación en paralelo, varias facturas comparten el
   // mismo tramo de tiempo y sumarlas lo contaría dos veces.
   const perInvoice = verdicts.length > 0 ? elapsedMs / verdicts.length : 0
+  printPhases(phases, elapsedMs)
   console.log(`\n${paint('bold', '─'.repeat(78))}`)
   console.log(
     `${verdicts.length} facturas · ` +
@@ -145,7 +178,7 @@ async function main(): Promise<void> {
   }
 
   const started = Date.now()
-  const verdicts = await reconcileFolders({
+  const { verdicts, phases } = await reconcileFolders({
     invoicesDir,
     supportDir,
     onProgress: (event) => {
@@ -156,9 +189,9 @@ async function main(): Promise<void> {
   const elapsedMs = Date.now() - started
 
   if (asJson) {
-    console.log(JSON.stringify({ verdicts, elapsedMs }, null, 2))
+    console.log(JSON.stringify({ verdicts, phases, elapsedMs }, null, 2))
   } else {
-    printReport(verdicts, elapsedMs)
+    printReport(verdicts, phases, elapsedMs)
   }
 }
 

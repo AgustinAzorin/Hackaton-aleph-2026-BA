@@ -80,11 +80,13 @@ export const LLM_CTX_PER_SLOT = 4096
  * Techo de tokens generados por respuesta.
  *
  * La gramática GBNF ya cierra el JSON solo, así que en la práctica nunca se
- * llega. Es un cortafuegos contra el caso patológico —un modelo que entra en
- * bucle dentro de un array y consume la ventana entera— que en un lote
- * secuencial se llevaba puestos varios minutos sin producir nada útil.
+ * llega: la salida más larga observada (una auditoría transcribiendo todos los
+ * ítems de un PO) ronda los 300-600 tokens. Es un cortafuegos contra el caso
+ * patológico —un modelo que entra en bucle dentro de un array y consume la
+ * ventana entera— que en un lote secuencial se llevaba puestos varios minutos
+ * sin producir nada útil.
  */
-export const LLM_MAX_PREDICT = 1024
+export const LLM_MAX_PREDICT = 768
 
 /**
  * Parámetros de decodificación: greedy y reproducible.
@@ -116,27 +118,53 @@ export const LLM_GENERATION_PARAMS = {
  * pesos una sola vez y produce cuatro tokens, así que el costo por factura cae
  * casi en proporción al número de slots. Es la razón por la que la fase 3 pasa
  * de un bucle secuencial a dos lotes (extracción y auditoría).
- *
- * El límite es la KV cache: cada slot reserva `LLM_CTX_PER_SLOT` tokens, y en
- * Qwen3-4B eso son ~150 MB por slot en fp16. Con el modelo ocupando 2,5 GB, el
- * número de slots se calcula contra la RAM libre real en vez de fijarse a ciegas.
  */
 export const LLM_MAX_SLOTS = 4
+
+/**
+ * Cuantización de la KV cache.
+ *
+ * Es lo que hace que el batcheo entre en el portátil objetivo. Con la cache en
+ * fp16, cuatro slots de 4096 tokens reservan 2,25 GiB **además** de los 2,5 GB
+ * de pesos: en una máquina de 8 GB no entra, el plan degrada a un solo slot y
+ * el batcheo no llega a ocurrir. A q8_0 los mismos cuatro slots ocupan 1,13 GiB
+ * y el total queda en ~3,7 GB, que sí entra con margen.
+ *
+ * El costo: la cache de atención se guarda con menos precisión. Sobre una
+ * transcripción corta, con decodificación greedy y una gramática que ya
+ * restringe cada token a un JSON válido, el efecto es muy chico — pero no es
+ * cero. Poner `QVAC_LLM_KV_CACHE=f16` lo desactiva y vuelve al comportamiento
+ * exacto de antes, a costa de necesitar más RAM para el mismo paralelismo.
+ */
+export const LLM_KV_CACHE_TYPE = process.env['QVAC_LLM_KV_CACHE'] ?? 'q8_0'
+
+/**
+ * Peso de la KV cache por token, en bytes.
+ *
+ * Derivado de la arquitectura de Qwen3-4B: 36 capas, 8 cabezas KV de 128
+ * dimensiones (1024 de dimensión KV), clave y valor. En fp16 son
+ * 2 x 36 x 1024 x 2 = 144 KiB por token; q8_0 lo baja a la mitad.
+ *
+ * La versión anterior de este archivo estimaba 160 MB por slot de 4096 tokens.
+ * El número real en fp16 es 576 MiB — 3,6 veces más. Esa estimación baja hacía
+ * dos cosas malas a la vez: el presupuesto creía que un slot costaba poco, y
+ * aun así el margen exigido dejaba a una máquina de 8 GB en un solo slot.
+ */
+const KV_BYTES_PER_TOKEN = LLM_KV_CACHE_TYPE === 'f16' ? 147_456 : 73_728
 
 /** Peso del modelo en RAM, para descontarlo del presupuesto. */
 const LLM_WEIGHTS_BYTES = 2_500_000_000
 
-/** KV cache aproximada de un slot de `LLM_CTX_PER_SLOT` tokens en Qwen3-4B. */
-const LLM_KV_BYTES_PER_SLOT = 160_000_000
-
 /** Margen que se le deja al sistema operativo y al resto de la app. */
-const HEADROOM_BYTES = 1_200_000_000
+const HEADROOM_BYTES = 900_000_000
 
 export interface LlmPlan {
   /** Slots de decodificación concurrentes. */
   slots: number
   /** Contexto total del proceso: se reparte entre los slots. */
   ctxSize: number
+  /** Por qué salió este número, para poder verlo en el stream de progreso. */
+  reason: string
 }
 
 /**
@@ -146,12 +174,39 @@ export interface LlmPlan {
  * 8 GB con el navegador abierto tiene mucho menos disponible que 8 GB, y
  * quedarse sin RAM en la fase 3 no degrada la velocidad, tumba la corrida.
  * Con un solo slot el comportamiento es exactamente el de antes.
+ *
+ * `QVAC_LLM_SLOTS` fuerza el número y saltea el cálculo. Existe porque el
+ * presupuesto automático es una estimación sobre memoria libre —que fluctúa— y
+ * medir el efecto del batcheo exige poder fijarlo.
  */
 export function planLlm(invoiceCount: number): LlmPlan {
-  const available = Math.max(os.freemem(), os.totalmem() * 0.5)
-  const forKv = available - LLM_WEIGHTS_BYTES - HEADROOM_BYTES
-  const affordable = Math.floor(forKv / LLM_KV_BYTES_PER_SLOT)
+  const ctxSize = (slots: number) => slots * LLM_CTX_PER_SLOT
+  const cap = Math.max(1, Math.min(LLM_MAX_SLOTS, invoiceCount))
 
-  const slots = Math.max(1, Math.min(LLM_MAX_SLOTS, affordable, Math.max(1, invoiceCount)))
-  return { slots, ctxSize: slots * LLM_CTX_PER_SLOT }
+  const forced = Number(process.env['QVAC_LLM_SLOTS'] ?? '')
+  if (Number.isInteger(forced) && forced > 0) {
+    const slots = Math.min(forced, Math.max(1, invoiceCount))
+    return {
+      slots,
+      ctxSize: ctxSize(slots),
+      reason: `forzado por QVAC_LLM_SLOTS=${forced}`
+    }
+  }
+
+  const kvPerSlot = LLM_CTX_PER_SLOT * KV_BYTES_PER_TOKEN
+  const available = Math.max(os.freemem(), os.totalmem() * 0.6)
+  const forKv = available - LLM_WEIGHTS_BYTES - HEADROOM_BYTES
+  const affordable = Math.floor(forKv / kvPerSlot)
+
+  const slots = Math.max(1, Math.min(cap, affordable))
+  const gb = (bytes: number) => (bytes / 2 ** 30).toFixed(1)
+
+  return {
+    slots,
+    ctxSize: ctxSize(slots),
+    reason:
+      slots < cap
+        ? `${gb(available)} GiB disponibles, ${gb(kvPerSlot)} GiB de KV por slot (${LLM_KV_CACHE_TYPE}) — usá QVAC_LLM_SLOTS para forzarlo`
+        : `${gb(available)} GiB disponibles, KV ${LLM_KV_CACHE_TYPE}`
+  }
 }

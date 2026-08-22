@@ -54,14 +54,18 @@ import {
   type AuditResult,
   type DiscrepancyReport,
   type InvoiceData,
+  type PhaseTiming,
   type ReasonCode,
+  type ReconciliationRun,
   type ReconciliationVerdict,
   type StageTiming,
   type VerifiedAudit
 } from '../types.js'
 import { missingCriticalFields, normalizeEvidence, normalizeInvoice } from './normalize.js'
 import {
+  LLM_CTX_PER_SLOT,
   LLM_GENERATION_PARAMS,
+  LLM_KV_CACHE_TYPE,
   OCR_MAG_RATIO,
   OCR_RECOGNIZER_BATCH_SIZE,
   ocrThreads,
@@ -107,10 +111,18 @@ async function withModel<T>(
   label: string,
   load: (onDownload: (progress: ModelProgressUpdate) => void) => Promise<string>,
   onProgress: OnProgress,
-  work: (modelId: string) => Promise<T>
+  work: (modelId: string) => Promise<T>,
+  ledger: PhaseTiming[] = []
 ): Promise<T> {
   onProgress({ stage: 'model', message: `Cargando ${label}...` })
 
+  // El registro se empuja antes de arrancar y se completa a medida que avanza
+  // la fase: si algo falla en el medio, lo medido hasta ahí sobrevive y el
+  // reporte muestra en qué paso se murió, en vez de perder la fase entera.
+  const timing: PhaseTiming = { phase: label, loadMs: 0, workMs: 0, unloadMs: 0 }
+  ledger.push(timing)
+
+  const loadStarted = now()
   const modelId = await load((progress) => {
     onProgress({
       stage: 'model',
@@ -119,16 +131,28 @@ async function withModel<T>(
       total: 100
     })
   })
+  timing.loadMs = now() - loadStarted
 
-  onProgress({ stage: 'model', message: `${label} listo.` })
+  onProgress({
+    stage: 'model',
+    message: `${label} listo en ${(timing.loadMs / 1000).toFixed(1)} s.`
+  })
+
+  const workStarted = now()
   try {
     return await work(modelId)
   } finally {
+    timing.workMs = now() - workStarted
+    const unloadStarted = now()
     await unloadModel({ modelId }).catch(() => {
       // Descargar es best-effort: si falla, no debe tapar el error original
       // ni tumbar el pipeline.
     })
-    onProgress({ stage: 'model', message: `${label} descargado.` })
+    timing.unloadMs = now() - unloadStarted
+    onProgress({
+      stage: 'model',
+      message: `${label} descargado — carga ${(timing.loadMs / 1000).toFixed(1)} s · trabajo ${(timing.workMs / 1000).toFixed(1)} s`
+    })
   }
 }
 
@@ -270,7 +294,8 @@ export interface OcrDocumentResult {
  */
 export async function ocrDocuments(
   files: string[],
-  onProgress: OnProgress = noop
+  onProgress: OnProgress = noop,
+  ledger: PhaseTiming[] = []
 ): Promise<OcrDocumentResult[]> {
   if (files.length === 0) return []
 
@@ -345,7 +370,8 @@ export async function ocrDocuments(
       }
 
       return results
-    }
+    },
+    ledger
   )
 }
 
@@ -381,7 +407,8 @@ export async function indexSupportDocuments(
   invoices: OcrDocumentResult[],
   workspace: string,
   onProgress: OnProgress = noop,
-  topK = 3
+  topK = 3,
+  ledger: PhaseTiming[] = []
 ): Promise<IndexAndRetrieveResult> {
   const usable = supportDocs.filter((d) => d.error === null && d.text.length > 0)
   const retrieved = new Map<string, RagSearchResult[]>()
@@ -449,7 +476,8 @@ export async function indexSupportDocuments(
     }
 
     return { indexed: usable.map((d) => d.file), retrieved }
-  })
+  },
+  ledger)
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,7 +1283,8 @@ function totalOf(timings: StageTiming[]): number {
  */
 export async function extractAndAudit(
   inputs: AuditInput[],
-  onProgress: OnProgress = noop
+  onProgress: OnProgress = noop,
+  ledger: PhaseTiming[] = []
 ): Promise<ReconciliationVerdict[]> {
   if (inputs.length === 0) return []
 
@@ -1273,6 +1302,10 @@ export async function extractAndAudit(
           // dimensiona en función de cuántos haya. Ver `tuning.ts`.
           ctx_size: plan.ctxSize,
           parallel: plan.slots,
+          // La KV cache cuantizada es lo que hace que varios slots entren en un
+          // portátil de 8 GB; ver `tuning.ts`.
+          'cache-type-k': LLM_KV_CACHE_TYPE,
+          'cache-type-v': LLM_KV_CACHE_TYPE,
           // Qwen3 es un modelo híbrido con canal de razonamiento. La gramática
           // JSON ya lo vuelve inalcanzable, pero apagarlo explícitamente no
           // depende de que la gramática siga siendo la que es.
@@ -1289,9 +1322,12 @@ export async function extractAndAudit(
         (input) => input.ocr.error === null && input.ocr.text.length > 0
       )
 
+      // El número de slots decide si el batcheo sirve de algo, y depende de la
+      // RAM libre del momento. Va al stream para que una corrida lenta se pueda
+      // diagnosticar sin volver a correrla.
       onProgress({
         stage: 'extract',
-        message: `Extrayendo ${extractable.length} facturas (${plan.slots} en paralelo)`,
+        message: `Extrayendo ${extractable.length} facturas · ${plan.slots} slot(s) en paralelo, ${LLM_CTX_PER_SLOT} tokens c/u (${plan.reason})`,
         current: 0,
         total: extractable.length
       })
@@ -1556,9 +1592,15 @@ export interface ReconcileOptions {
  * Corre el pipeline completo: OCR → indexación y recuperación → extracción y
  * auditoría. Las tres fases cargan un solo modelo por vez.
  */
-export async function reconcileFolders(options: ReconcileOptions): Promise<ReconciliationVerdict[]> {
+export async function reconcileFolders(options: ReconcileOptions): Promise<ReconciliationRun> {
   const onProgress = options.onProgress ?? noop
   const workspace = options.workspace ?? `invoices-${Date.now()}`
+  const startedAll = now()
+
+  // El libro de fases: cada `withModel` anota acá su carga, su trabajo y su
+  // descarga. Es lo que después permite decir "el tiempo se fue en montar los
+  // pesos" o "se fue en inferencia" sin tener que volver a correr todo.
+  const phases: PhaseTiming[] = []
 
   const [invoiceFiles, supportFiles] = await Promise.all([
     listDocuments(options.invoicesDir),
@@ -1571,7 +1613,7 @@ export async function reconcileFolders(options: ReconcileOptions): Promise<Recon
 
   // Fase 1: un solo modelo OCR para facturas y respaldos.
   onProgress({ stage: 'ocr', message: 'Fase 1/3 — OCR de todos los documentos' })
-  const allOcr = await ocrDocuments([...supportFiles, ...invoiceFiles], onProgress)
+  const allOcr = await ocrDocuments([...supportFiles, ...invoiceFiles], onProgress, phases)
   const supportOcr = allOcr.slice(0, supportFiles.length)
   const invoiceOcr = allOcr.slice(supportFiles.length)
 
@@ -1619,7 +1661,14 @@ export async function reconcileFolders(options: ReconcileOptions): Promise<Recon
   // citó PO. El modelo se descarga al salir.
   if (semanticOcr.length > 0) {
     try {
-      const result = await indexSupportDocuments(supportOcr, semanticOcr, workspace, onProgress)
+      const result = await indexSupportDocuments(
+        supportOcr,
+        semanticOcr,
+        workspace,
+        onProgress,
+        3,
+        phases
+      )
       for (const inv of semanticOcr) {
         evidenceByFile.set(inv.file, { kind: 'semantic', hits: result.retrieved.get(inv.file) ?? [] })
       }
@@ -1648,13 +1697,14 @@ export async function reconcileFolders(options: ReconcileOptions): Promise<Recon
       ocr: entry,
       evidence: evidenceByFile.get(entry.file) ?? { kind: 'semantic', hits: [] }
     })),
-    onProgress
+    onProgress,
+    phases
   )
 
   await ragCloseWorkspace({ workspace, deleteOnClose: true }).catch(() => {})
   onProgress({ stage: 'done', message: 'Pipeline completo.' })
 
-  return verdicts
+  return { verdicts, phases, elapsedMs: now() - startedAll }
 }
 
 /** Cierra la conexión RPC del SDK para que el proceso pueda terminar. */

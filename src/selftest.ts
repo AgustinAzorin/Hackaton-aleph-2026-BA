@@ -901,6 +901,43 @@ await test('no se reservan más slots que facturas hay para procesar', () => {
   assert.ok(planLlm(2).slots <= 2)
 })
 
+await test('el presupuesto alcanza para batchear en un portátil de 8 GB', () => {
+  // La regresión que esta prueba cubre: la primera versión del presupuesto
+  // estimaba la KV cache 3,6 veces por debajo de su costo real y además exigía
+  // un margen que dejaba a una máquina de 8 GB en UN slot. El batcheo quedaba
+  // escrito pero nunca se activaba, y la corrida sólo mejoraba un 12%.
+  //
+  // El cálculo real, con la cache en q8_0: 36 capas x 1024 de dimensión KV x
+  // clave y valor = 72 KiB por token, 288 MiB por slot de 4096. Cuatro slots
+  // son 1,13 GiB sobre los 2,5 GB de pesos.
+  const kvPerSlotBytes = LLM_CTX_PER_SLOT * 73_728
+  const fourSlots = 4 * kvPerSlotBytes + 2.5e9
+  assert.ok(
+    fourSlots < 4.5e9,
+    `cuatro slots piden ${(fourSlots / 2 ** 30).toFixed(1)} GiB; no entran en un portátil de 8 GB`
+  )
+})
+
+await test('QVAC_LLM_SLOTS fuerza el paralelismo y saltea la estimación', () => {
+  // El presupuesto automático mira memoria libre, que fluctúa. Sin una forma de
+  // fijar el número no hay manera de medir si el batcheo sirve.
+  const previous = process.env['QVAC_LLM_SLOTS']
+  try {
+    process.env['QVAC_LLM_SLOTS'] = '3'
+    const plan = planLlm(7)
+    assert.equal(plan.slots, 3)
+    assert.equal(plan.ctxSize, 3 * LLM_CTX_PER_SLOT)
+    assert.match(plan.reason, /QVAC_LLM_SLOTS/)
+
+    // Ni forzado se piden más slots que facturas: serían slots vacíos.
+    process.env['QVAC_LLM_SLOTS'] = '8'
+    assert.equal(planLlm(2).slots, 2)
+  } finally {
+    if (previous === undefined) delete process.env['QVAC_LLM_SLOTS']
+    else process.env['QVAC_LLM_SLOTS'] = previous
+  }
+})
+
 await test('el contexto por slot cubre el prompt más largo del pipeline', () => {
   // El techo real: system de auditoría + factura en JSON + respaldo recortado
   // a 6000 caracteres, más lo que el modelo genere. Si este margen se pierde,

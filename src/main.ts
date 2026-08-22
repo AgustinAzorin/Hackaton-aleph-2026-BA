@@ -90,7 +90,7 @@ ipcMain.handle(
     const started = Date.now()
 
     try {
-      const verdicts = await reconcileFolders({
+      const run = await reconcileFolders({
         invoicesDir: request.invoicesDir,
         supportDir: request.supportDir,
         onProgress: (progress: ProgressEvent) => {
@@ -101,7 +101,7 @@ ipcMain.handle(
         }
       })
 
-      return { ok: true, verdicts, elapsedMs: Date.now() - started }
+      return { ok: true, verdicts: run.verdicts, phases: run.phases, elapsedMs: Date.now() - started }
     } catch (error) {
       // El pipeline degrada cada documento por su cuenta, así que llegar acá
       // significa un fallo de la corrida entera (carpeta ilegible, modelo que

@@ -151,6 +151,34 @@ export interface StageTiming {
   ms: number
 }
 
+/**
+ * Costo de una fase completa, con la carga del modelo separada del trabajo.
+ *
+ * La distinción es la que decide qué optimizar. Si el tiempo está en `loadMs`,
+ * el problema es de E/S y la respuesta es cachear o usar un modelo más chico;
+ * si está en `workMs`, es de inferencia y la respuesta es batchear o bajar
+ * resolución. Sin separarlos, las dos se ven igual desde afuera: "la fase
+ * tardó mucho".
+ */
+export interface PhaseTiming {
+  /** Modelo que estuvo vivo durante la fase. */
+  phase: string
+  /** Descargar (si hizo falta), abrir el archivo y montar los pesos en RAM. */
+  loadMs: number
+  /** Inferencia propiamente dicha. */
+  workMs: number
+  /** Liberar la RAM antes de que entre el modelo siguiente. */
+  unloadMs: number
+}
+
+/** Resultado completo de una corrida: los veredictos y dónde se fue el tiempo. */
+export interface ReconciliationRun {
+  verdicts: ReconciliationVerdict[]
+  phases: PhaseTiming[]
+  /** Reloj de pared de punta a punta. */
+  elapsedMs: number
+}
+
 export interface ReconciliationVerdict {
   /** Nombre del archivo de factura auditado. */
   file: string
