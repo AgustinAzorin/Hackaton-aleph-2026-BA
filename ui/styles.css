@@ -1,0 +1,553 @@
+/*
+ * Interfaz oscura y densa, sin frameworks.
+ *
+ * La prioridad es que un auditor lea el estado de una factura en menos de
+ * cinco segundos: el veredicto va primero, en color, y el motivo inmediatamente
+ * al lado. Todo lo demás —latencias, scores, desglose— es secundario y se
+ * mantiene tipográficamente atenuado.
+ */
+
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-hover: #1c202a;
+  --border: #262b36;
+  --text: #e6e9ef;
+  --muted: #8b93a7;
+  --faint: #5b6479;
+
+  --match: #34d399;
+  --discrepancy: #f87171;
+  --uncertain: #fbbf24;
+  --error: #a78bfa;
+  --accent: #60a5fa;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --- Encabezado --------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 22px 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.subtitle strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.badge-local {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--match);
+  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.15);
+}
+
+main {
+  padding: 24px 28px 48px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+/* --- Selección de carpetas ---------------------------------------------- */
+
+.setup {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 16px;
+  align-items: end;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.picker-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.path {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  /*
+   * Una ruta larga se trunca por la izquierda: la carpeta final es lo que
+   * importa. `direction: rtl` mueve el recorte a ese lado, y `unicode-bidi:
+   * plaintext` hace que la dirección del texto la fije su primer carácter
+   * fuerte — sin eso, la barra inicial de "/Users/…" se dibuja al final.
+   */
+  direction: rtl;
+  unicode-bidi: plaintext;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.path[data-empty="true"] {
+  direction: ltr;
+  color: var(--faint);
+  font-style: italic;
+}
+
+.btn {
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-hover);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: #232834;
+  border-color: #333a49;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1220;
+  font-weight: 600;
+  padding: 8px 22px;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #7cb6fb;
+  border-color: #7cb6fb;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* --- Progreso ------------------------------------------------------------ */
+
+.progress {
+  margin-top: 20px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.progress-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+
+.stage {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.elapsed {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+/* Mientras no hay porcentaje conocido, la barra late en vez de mentir un 0%. */
+.bar-fill.indeterminate {
+  width: 35%;
+  animation: slide 1.4s ease-in-out infinite;
+}
+
+@keyframes slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(340%);
+  }
+}
+
+.log {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 132px;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.log li {
+  padding: 1px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.log .ts {
+  color: var(--faint);
+  margin-right: 8px;
+}
+
+/* --- Resumen ------------------------------------------------------------- */
+
+.summary {
+  display: flex;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.stat {
+  flex: 1;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.stat-value {
+  display: block;
+  font-size: 24px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.stat-label {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stat-match {
+  border-left-color: var(--match);
+}
+.stat-discrepancy {
+  border-left-color: var(--discrepancy);
+}
+.stat-uncertain {
+  border-left-color: var(--uncertain);
+}
+.stat-error {
+  border-left-color: var(--error);
+}
+.stat-time {
+  border-left-color: var(--faint);
+}
+
+/* --- Tabla de resultados -------------------------------------------------- */
+
+.results {
+  margin-top: 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+thead th {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+th.num,
+td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.col-verdict {
+  width: 132px;
+}
+
+/* El proveedor cede espacio antes que el total o el veredicto. */
+.col-vendor {
+  min-width: 180px;
+}
+
+tbody td {
+  padding: 11px 16px;
+  border-bottom: 1px solid rgba(38, 43, 54, 0.6);
+  vertical-align: top;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.row-main {
+  cursor: pointer;
+}
+
+.row-main:hover td {
+  background: var(--panel-hover);
+}
+
+.verdict {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.verdict-MATCH {
+  background: rgba(52, 211, 153, 0.13);
+  color: var(--match);
+}
+.verdict-DISCREPANCY {
+  background: rgba(248, 113, 113, 0.13);
+  color: var(--discrepancy);
+}
+.verdict-UNCERTAIN {
+  background: rgba(251, 191, 36, 0.13);
+  color: var(--uncertain);
+}
+.verdict-ERROR {
+  background: rgba(167, 139, 250, 0.13);
+  color: var(--error);
+}
+
+.file {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.reason {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-family: var(--sans);
+}
+
+.support {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.score {
+  color: var(--faint);
+}
+
+.latency {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.chevron {
+  display: inline-block;
+  width: 12px;
+  color: var(--faint);
+  transition: transform 0.15s ease;
+}
+
+.row-main[aria-expanded="true"] .chevron {
+  transform: rotate(90deg);
+}
+
+/* --- Desglose auditable --------------------------------------------------- */
+
+.detail td {
+  padding: 0 16px 14px 16px;
+  background: rgba(15, 17, 21, 0.5);
+}
+
+.detail-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.diff {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto auto;
+  gap: 4px 16px;
+  align-items: baseline;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--discrepancy);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.diff-field {
+  font-weight: 500;
+  font-size: 12.5px;
+}
+
+.diff-values {
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.diff-values .inv {
+  color: var(--discrepancy);
+}
+
+.diff-values .sup {
+  color: var(--match);
+}
+
+.diff-note {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.timings {
+  margin-top: 4px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.no-diff {
+  color: var(--muted);
+  font-size: 12.5px;
+  padding: 4px 0;
+}
+
+/* --- Estados ------------------------------------------------------------- */
+
+.empty {
+  margin: 28px auto 0;
+  max-width: 620px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  line-height: 1.65;
+}
+
+.error-banner {
+  margin-top: 20px;
+  padding: 12px 16px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: 8px;
+  background: rgba(248, 113, 113, 0.08);
+  color: var(--discrepancy);
+  font-size: 13px;
+}
+
+@media (max-width: 900px) {
+  .setup {
+    grid-template-columns: 1fr;
+  }
+  .summary {
+    flex-wrap: wrap;
+  }
+  .stat {
+    min-width: 140px;
+  }
+}

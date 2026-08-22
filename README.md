@@ -14,8 +14,8 @@ Conciliar facturas contra órdenes de compra es trabajo manual, repetitivo y lle
 | --- | --- |
 | **M0** — Datos de prueba sintéticos con discrepancias plantadas | ✅ |
 | **M1** — Pipeline CLI de punta a punta | ✅ verificado 6/6 |
-| M2 — Backend Electron + IPC | pendiente |
-| M3 — Dashboard UI | pendiente |
+| **M2** — Backend Electron + IPC | ✅ |
+| **M3** — Dashboard UI | ✅ |
 | M4 — Pulido y métricas | pendiente |
 
 ## Instalación
@@ -34,7 +34,10 @@ npm install
 # 1. Generar los datos de prueba (facturas + órdenes de compra sintéticas)
 npm run samples
 
-# 2. Correr el pipeline completo contra samples/
+# 2a. Abrir la app de escritorio
+npm start
+
+# 2b. …o correr el mismo pipeline desde consola
 npm run cli
 
 # Contra carpetas propias:
@@ -141,6 +144,16 @@ zod es la segunda barrera, porque la gramática garantiza la forma pero no la co
 
 Cada punto de falla degrada a un estado visible en el reporte en vez de tumbar la corrida: modelo que no carga, archivo ilegible, OCR vacío, JSON malformado, PO inexistente, búsqueda RAG fallida. Un documento roto marca esa fila y el lote sigue. Cada etapa se cronometra por separado y las latencias viajan en el resultado.
 
+## La aplicación de escritorio
+
+`npm start` compila el proceso principal y abre la ventana de Electron. El dashboard tiene selección nativa de carpetas, progreso en vivo por etapa y una tabla de auditoría donde cada fila se expande para mostrar el desglose que sostiene el veredicto.
+
+La superficie que cruza de un proceso al otro es deliberadamente mínima. La ventana corre con `contextIsolation: true`, `nodeIntegration: false` y `sandbox: true`, así que el renderer no tiene acceso a Node ni al sistema de archivos: sólo ve las tres funciones que expone [`src/preload.ts`](src/preload.ts) — elegir una carpeta, correr el pipeline y escuchar el progreso. Los documentos y los modelos nunca salen del proceso principal; a la interfaz sólo le llegan veredictos ya calculados.
+
+Todo el texto que llega desde el pipeline —nombres de proveedor, descripciones de ítems, resúmenes del modelo— se inserta con `textContent`, nunca con `innerHTML`. Son datos transcritos de documentos que el usuario no controla, y un PDF con markup en su texto no debería poder inyectar nada en la interfaz.
+
+`pipeline:run` nunca rechaza: los fallos vuelven como `{ ok: false, error }`, de modo que un problema durante la corrida deja un mensaje visible en pantalla en vez de una ventana colgada.
+
 ## Modelos
 
 Todos se resuelven por su constante exportada por el SDK, verificada contra el registry tipado del paquete y los ejemplos oficiales.
@@ -188,9 +201,13 @@ src/
   types.ts                  schemas zod + JSON Schema para structured outputs
   cli.ts                    entry point del M1
   selftest.ts               verificación offline (npm run verify)
+  main.ts                   proceso principal de Electron e IPC
+  preload.ts                puente con context isolation
   services/
     qvacService.ts          toda la inferencia @qvac/sdk
     rasterize.ts            PDF → PNG con pdf-to-img
+ui/
+  index.html  styles.css  app.js    dashboard, sin frameworks
 samples/
   generate.ts               generador de datos de prueba
   invoices/  support/       documentos generados
