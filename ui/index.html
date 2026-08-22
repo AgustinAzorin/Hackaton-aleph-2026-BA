@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self';"
+    />
+    <title>Reconciliador de Facturas · QVAC</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Reconciliador de Facturas</h1>
+        <p class="subtitle">
+          Auditoría de facturas contra sus documentos de respaldo.
+          <strong>Nada sale de esta máquina.</strong>
+        </p>
+      </div>
+      <div class="badge-local" title="Toda la inferencia corre localmente con @qvac/sdk">
+        <span class="dot"></span>100% on-device
+      </div>
+    </header>
+
+    <main>
+      <section class="setup" aria-label="Selección de carpetas">
+        <div class="picker">
+          <span class="picker-label">Facturas a auditar</span>
+          <div class="picker-row">
+            <button type="button" class="btn" id="pick-invoices">Elegir carpeta…</button>
+            <code class="path" id="path-invoices" data-empty="true">Ninguna carpeta elegida</code>
+          </div>
+        </div>
+
+        <div class="picker">
+          <span class="picker-label">Documentos de respaldo</span>
+          <div class="picker-row">
+            <button type="button" class="btn" id="pick-support">Elegir carpeta…</button>
+            <code class="path" id="path-support" data-empty="true">Ninguna carpeta elegida</code>
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-primary" id="run" disabled>Reconciliar</button>
+      </section>
+
+      <section class="progress" id="progress" hidden aria-live="polite">
+        <div class="progress-head">
+          <span class="stage" id="stage">Iniciando…</span>
+          <span class="elapsed" id="elapsed">0,0 s</span>
+        </div>
+        <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+          <div class="bar-fill" id="bar-fill"></div>
+        </div>
+        <ol class="log" id="log"></ol>
+      </section>
+
+      <section class="summary" id="summary" hidden>
+        <div class="stat stat-match">
+          <span class="stat-value" id="count-match">0</span>
+          <span class="stat-label">coinciden</span>
+        </div>
+        <div class="stat stat-discrepancy">
+          <span class="stat-value" id="count-discrepancy">0</span>
+          <span class="stat-label">discrepancias</span>
+        </div>
+        <div class="stat stat-uncertain">
+          <span class="stat-value" id="count-uncertain">0</span>
+          <span class="stat-label">inciertas</span>
+        </div>
+        <div class="stat stat-error">
+          <span class="stat-value" id="count-error">0</span>
+          <span class="stat-label">errores</span>
+        </div>
+        <div class="stat stat-time">
+          <span class="stat-value" id="count-time">—</span>
+          <span class="stat-label">de proceso</span>
+        </div>
+      </section>
+
+      <section class="results" id="results" hidden>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col" class="col-verdict">Veredicto</th>
+              <th scope="col">Factura</th>
+              <th scope="col" class="col-vendor">Proveedor</th>
+              <th scope="col" class="num">Total</th>
+              <th scope="col">Respaldo</th>
+              <th scope="col" class="num">Latencia</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </section>
+
+      <p class="empty" id="empty">
+        Elegí la carpeta con las facturas y la carpeta con las órdenes de compra, remitos o
+        extractos que las respaldan. El pipeline transcribe cada documento con OCR, indexa los
+        respaldos y audita cada factura contra la evidencia recuperada.
+      </p>
+
+      <p class="error-banner" id="error-banner" hidden></p>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
