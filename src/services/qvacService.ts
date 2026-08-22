@@ -529,28 +529,64 @@ const CORPORATE_SUFFIXES = new Set([
   'company'
 ])
 
+/**
+ * Forma normalizada de una razón social: minúsculas, sin puntuación, sin
+ * sufijos societarios y con el espaciado colapsado. Los puntos y apóstrofos
+ * se eliminan (no se reemplazan por espacio) para que "S.A." colapse en "sa"
+ * y quede cubierto por CORPORATE_SUFFIXES.
+ */
+function normalizedVendorName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[.'’]/g, '')
+    .replace(/[^a-z0-9áéíóúñü\s]/gi, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 0 && !CORPORATE_SUFFIXES.has(token))
+    .join(' ')
+}
+
 /** Reduce una razón social a sus palabras distintivas. */
 function vendorTokens(name: string): Set<string> {
   return new Set(
-    name
-      .toLowerCase()
-      .replace(/[^a-z0-9áéíóúñü\s]/gi, ' ')
-      .split(/\s+/)
-      .filter((token) => token.length > 2 && !CORPORATE_SUFFIXES.has(token))
+    normalizedVendorName(name)
+      .split(' ')
+      .filter((token) => token.length > 2)
   )
 }
 
 /**
- * Dos razones sociales se consideran el mismo proveedor si comparten alguna
- * palabra distintiva. "Northwind Logistics Inc." y "Northwind Logistics"
- * coinciden; "Quantum Freight Systems" y "Northwind Logistics" no.
+ * Decide si dos razones sociales nombran al mismo proveedor, con una
+ * jerarquía conservadora:
+ *
+ *   1. Igualdad exacta tras normalizar (minúsculas, puntuación, espaciado,
+ *      sufijos societarios): "ACME S.A." ≡ "acme sa".
+ *   2. Solapamiento de tokens distintivos: la MAYORÍA de los tokens del
+ *      nombre más corto debe aparecer en el otro (>= 2 compartidos, o >= 60%).
+ *      "Northwind Logistics Inc." ≡ "Northwind Logistics"; un token garbleado
+ *      por OCR en un nombre de tres palabras sigue coincidiendo.
+ *   3. Cualquier cosa más débil se trata como proveedores DISTINTOS, lo que
+ *      vía la salvaguarda existente degrada a UNCERTAIN — nunca a una
+ *      acusación por identidad de proveedor.
+ *
+ * Compartir UNA sola palabra no prueba identidad: "Acme Logistics" y "Beta
+ * Logistics" son empresas distintas que comparten un rubro. La similitud
+ * difusa sola jamás prueba identidad.
  */
-function sameVendor(a: string, b: string): boolean {
+export function sameVendor(a: string, b: string): boolean {
+  const normA = normalizedVendorName(a)
+  const normB = normalizedVendorName(b)
+  if (normA.length === 0 || normB.length === 0) return false
+  if (normA === normB) return true
+
   const tokensA = vendorTokens(a)
   const tokensB = vendorTokens(b)
   if (tokensA.size === 0 || tokensB.size === 0) return false
-  for (const token of tokensA) if (tokensB.has(token)) return true
-  return false
+
+  const [shorter, longer] = tokensA.size <= tokensB.size ? [tokensA, tokensB] : [tokensB, tokensA]
+  let shared = 0
+  for (const token of shorter) if (longer.has(token)) shared++
+
+  return shared >= 2 || shared / shorter.size >= 0.6
 }
 
 /** Normaliza la descripción de un ítem para poder compararla. */

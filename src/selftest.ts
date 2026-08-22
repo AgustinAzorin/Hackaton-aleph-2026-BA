@@ -17,6 +17,7 @@ import {
   blocksToText,
   buildRetrievalQuery,
   listDocuments,
+  sameVendor,
   supportLabel,
   verifyAgainstEvidence
 } from './services/qvacService.js'
@@ -635,6 +636,47 @@ await test('moneda del respaldo ilegible no tapa una discrepancia numérica', ()
   )
   assert.equal(result.verdict, 'DISCREPANCY')
   assert.ok(result.summary.includes('sin verificar'))
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nIdentidad de proveedor (jerarquía conservadora)')
+
+await test('la normalización iguala variantes de puntuación y sufijo societario', () => {
+  assert.equal(sameVendor('ACME S.A.', 'acme sa'), true)
+  assert.equal(sameVendor('ACME S.A.', 'ACME S.A'), true)
+  assert.equal(sameVendor('acme sa', 'ACME S.A'), true)
+})
+
+await test('compartir un solo rubro NO prueba identidad', () => {
+  // La regresión que motiva el cambio: con la regla vieja de "cualquier token
+  // compartido", estas dos empresas distintas se consideraban la misma.
+  assert.equal(sameVendor('Acme Logistics', 'Beta Logistics'), false)
+  assert.equal(sameVendor('Quantum Freight Systems', 'Northwind Logistics Inc.'), false)
+})
+
+await test('el sufijo societario no impide reconocer al mismo proveedor (nivel 1)', () => {
+  assert.equal(sameVendor('Northwind Logistics Inc.', 'Northwind Logistics'), true)
+})
+
+await test('un token garbleado por OCR en un nombre de tres palabras aún coincide', () => {
+  assert.equal(sameVendor('Quantum Freight Syst3ms', 'Quantum Freight Systems'), true)
+})
+
+await test('en un nombre de dos palabras, un token garbleado degrada a distinto (conservador)', () => {
+  // Con la mitad del nombre ilegible ya no hay mayoría de tokens compartidos.
+  // El costo es un UNCERTAIN de más — nunca una acusación contra el proveedor
+  // equivocado, que es el fallo caro.
+  assert.equal(sameVendor('Northwind Log1stics', 'Northwind Logistics'), false)
+})
+
+await test('un proveedor distinto degrada a UNCERTAIN, jamás a DISCREPANCY', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Logistics', 'PO-5003', 4620, []),
+    supportOf('PO-5003.pdf', 'Beta Logistics', 4200, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.deepEqual(result.discrepancies, [])
 })
 
 // ---------------------------------------------------------------------------
