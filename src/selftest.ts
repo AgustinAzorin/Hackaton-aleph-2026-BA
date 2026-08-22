@@ -230,12 +230,18 @@ const item = (description: string, quantity: number, unitPrice: number) => ({
 })
 
 /** Factura con ítems que suman su total, salvo que se indique lo contrario. */
-const invoiceOf = (vendorName: string, poReference: string, totalAmount: number, items: LineItem[]) => ({
+const invoiceOf = (
+  vendorName: string,
+  poReference: string,
+  totalAmount: number,
+  items: LineItem[],
+  currency = 'USD'
+) => ({
   invoiceNumber: 'INV-0000',
   vendorName,
   date: '2026-07-01',
   totalAmount,
-  currency: 'USD',
+  currency,
   poReference,
   items
 })
@@ -245,11 +251,13 @@ const supportOf = (
   supportDocumentId: string,
   supportVendorName: string,
   supportTotalAmount: number,
-  supportItems: LineItem[]
+  supportItems: LineItem[],
+  supportCurrency = 'USD'
 ) => ({
   supportDocumentId,
   supportVendorName,
   supportTotalAmount,
+  supportCurrency,
   supportItems,
   discrepancies: [],
   verdict: 'MATCH' as const,
@@ -471,6 +479,64 @@ await test('una variación menor de OCR no convierte un ítem en faltante', () =
 })
 
 // ---------------------------------------------------------------------------
+console.log('\nMonedas (los montos sólo son comparables en la misma moneda)')
+
+await test('misma moneda en ambos documentos permite MATCH', () => {
+  const items = [item('A4 Copy Paper, 80gsm, ream', 40, 6.5)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 260, items, 'USD'),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items, 'usd '),
+    0.88
+  )
+  assert.equal(result.verdict, 'MATCH', 'la normalización de moneda no debería distinguir mayúsculas')
+})
+
+await test('monedas distintas con montos iguales NO es MATCH: es UNCERTAIN sin acusaciones', () => {
+  // ARS 1000 contra USD 1000 no son comparables; convertir implícitamente
+  // sería inventar un tipo de cambio que el sistema no tiene.
+  const items = [item('Servicio de flete', 1, 1000)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 1000, items, 'ARS'),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 1000, items, 'USD'),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.deepEqual(result.discrepancies, [], 'una moneda distinta no debe producir acusaciones numéricas')
+  assert.ok(result.summary.includes('ARS') && result.summary.includes('USD'), `el resumen debe explicar las monedas: ${result.summary}`)
+})
+
+await test('monedas distintas también bloquean cuando los montos difieren', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 999999, [], 'EUR'),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 1000, [], 'ARS'),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.deepEqual(result.discrepancies, [])
+})
+
+await test('moneda del respaldo ilegible: los montos se comparan pero el resumen lo advierte', () => {
+  const items = [item('A4 Copy Paper, 80gsm, ream', 40, 6.5)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 260, items, 'USD'),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items, ''),
+    0.88
+  )
+  assert.equal(result.verdict, 'MATCH', 'sin moneda de respaldo los chequeos numéricos deben seguir corriendo')
+  assert.ok(result.summary.includes('sin verificar'), `el resumen debe advertir la moneda sin verificar: ${result.summary}`)
+})
+
+await test('moneda del respaldo ilegible no tapa una discrepancia numérica', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5006', 915, []),
+    supportOf('PO-5006.pdf', 'Acme Office Supplies LLC', 840, [], ''),
+    0.87
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(result.summary.includes('sin verificar'))
+})
+
+// ---------------------------------------------------------------------------
 console.log('\nEtiqueta del documento de respaldo')
 
 await test('recupera el nombre de archivo del prefijo del fragmento', () => {
@@ -491,6 +557,7 @@ await test('la evidencia precede al veredicto en el JSON Schema', () => {
     'supportDocumentId',
     'supportVendorName',
     'supportTotalAmount',
+    'supportCurrency',
     'supportItems',
     'discrepancies'
   ]) {

@@ -75,6 +75,12 @@ export const AuditResultSchema = z.object({
   supportVendorName: z.string(),
   /** Total leído del documento de respaldo; 0 si no se pudo leer. */
   supportTotalAmount: z.number(),
+  /**
+   * Código de moneda impreso en el respaldo (ISO, p. ej. "USD"); "" si no se
+   * pudo leer. Nunca se copia de la factura: si las monedas difieren, los
+   * montos no son comparables y el veredicto debe degradar a UNCERTAIN.
+   */
+  supportCurrency: z.string(),
   /** Ítems transcritos del respaldo. El código los compara, no el modelo. */
   supportItems: z.array(LineItemSchema),
   discrepancies: z.array(DiscrepancyReportSchema),

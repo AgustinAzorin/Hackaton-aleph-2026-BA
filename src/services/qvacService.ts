@@ -489,9 +489,10 @@ La comparación la hace después un verificador determinista. Tu único trabajo 
 1. "supportDocumentId": el identificador del respaldo que corresponde a esta factura, por ejemplo "PO-5003.pdf". Si ninguno de los fragmentos recuperados corresponde a esta factura, usá "".
 2. "supportVendorName": el proveedor que figura en ese respaldo, copiado literal. Este campo es crítico: si el respaldo es de otro proveedor, es la señal de que la recuperación trajo el documento equivocado. No lo copies de la factura — leelo del respaldo.
 3. "supportTotalAmount": el TOTAL impreso en el respaldo, como número. Buscalo en el texto. Si no lo encontrás, usá 0. Nunca lo deduzcas del total de la factura.
-4. "supportItems": TODOS los ítems que figuran en el respaldo, uno por uno, con su descripción, cantidad, precio unitario e importe. Transcribí la lista completa aunque sea larga: si omitís un ítem, el verificador va a creer que la factura dejó de facturarlo.
-5. "discrepancies": dejalo vacío ([]). Lo completa el verificador.
-6. "verdict", 7. "confidence", 8. "summary": tu impresión general. El verificador puede corregirla.
+4. "supportCurrency": el código de moneda impreso en el respaldo (USD, EUR, ARS, etc.), transcrito del texto del respaldo. Si el respaldo no menciona ninguna moneda legible, usá "". NUNCA lo copies de la factura: si el respaldo está en otra moneda, ese dato es exactamente lo que el verificador necesita saber.
+5. "supportItems": TODOS los ítems que figuran en el respaldo, uno por uno, con su descripción, cantidad, precio unitario e importe. Transcribí la lista completa aunque sea larga: si omitís un ítem, el verificador va a creer que la factura dejó de facturarlo.
+6. "discrepancies": dejalo vacío ([]). Lo completa el verificador.
+7. "verdict", 8. "confidence", 9. "summary": tu impresión general. El verificador puede corregirla.
 
 Advertencias:
 - No inventes valores. Si algo no está en el texto del respaldo, usá "" o 0.
@@ -577,6 +578,17 @@ function sameItem(a: string, b: string): boolean {
   return shared / Math.min(tokensA.length, tokensB.length) >= 0.5
 }
 
+/**
+ * Normaliza un código de moneda a ISO de tres letras (mayúsculas); `null` si
+ * el valor no parece un código legible. Acepta cualquier código ISO (ARS, USD,
+ * EUR, ...): la comparación es igualdad de strings normalizados, sin lista
+ * blanca embebida en la lógica.
+ */
+export function normalizeCurrency(raw: string): string | null {
+  const code = raw.trim().toUpperCase()
+  return /^[A-Z]{3}$/.test(code) ? code : null
+}
+
 const money = (value: number) => value.toFixed(2)
 
 /**
@@ -638,6 +650,28 @@ export function verifyAgainstEvidence(
     return uncertain(
       `La factura referencia ${poReference} pero el respaldo recuperado es ${audit.supportDocumentId}; no se encontró la orden de compra citada.`
     )
+  }
+
+  // --- ¿Los montos son siquiera comparables? ------------------------------
+  // Dos monedas distintas hacen incomparables los montos: 1000 ARS contra
+  // 1000 USD NO es una coincidencia. Nunca se convierte implícitamente; una
+  // conversión necesita un tipo de cambio y una fecha que este sistema no
+  // tiene. La comparación es igualdad de códigos normalizados — no depende
+  // de ninguna lista de monedas soportadas.
+  const invoiceCurrency = normalizeCurrency(invoice.currency)
+  const supportCurrency = normalizeCurrency(audit.supportCurrency)
+  const currencyNotes: string[] = []
+
+  if (invoiceCurrency !== null && supportCurrency !== null && invoiceCurrency !== supportCurrency) {
+    return uncertain(
+      `La factura está en ${invoiceCurrency} pero ${audit.supportDocumentId} está en ${supportCurrency}; los montos no son comparables sin una conversión explícita.`
+    )
+  }
+  if (supportCurrency === null) {
+    // Sin moneda legible en el respaldo, los chequeos numéricos siguen (los
+    // montos podrían igualmente delatar un desvío), pero el resultado lo dice:
+    // no se fabrica una moneda que el documento no muestra.
+    currencyNotes.push('moneda del respaldo sin verificar')
   }
 
   if (audit.supportTotalAmount <= 0) {
@@ -746,17 +780,19 @@ export function verifyAgainstEvidence(
     headline.push(`${itemIssues} ítem(s) no se corresponden`)
   }
 
+  const caveat = currencyNotes.length > 0 ? ` (${currencyNotes.join('; ')})` : ''
+
   if (discrepancies.length === 0) {
     // La evidencia respalda una coincidencia. Se conserva el resumen del
     // modelo, que suele redactarlo mejor que una plantilla.
-    return { ...audit, verdict: 'MATCH', discrepancies: [] }
+    return { ...audit, verdict: 'MATCH', discrepancies: [], summary: `${audit.summary}${caveat}` }
   }
 
   return {
     ...audit,
     verdict: 'DISCREPANCY',
     confidence: 0.99,
-    summary: `Contra ${audit.supportDocumentId}: ${headline.join(' y ')}.`,
+    summary: `Contra ${audit.supportDocumentId}: ${headline.join(' y ')}.${caveat}`,
     discrepancies
   }
 }
@@ -920,6 +956,7 @@ export async function extractAndAudit(
               supportDocumentId: bestLabel ?? '',
               supportVendorName: '',
               supportTotalAmount: 0,
+              supportCurrency: '',
               supportItems: [],
               discrepancies: [],
               verdict: 'UNCERTAIN',
