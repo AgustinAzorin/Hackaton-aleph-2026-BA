@@ -47,6 +47,7 @@ import {
   type ReconciliationVerdict,
   type StageTiming
 } from '../types.js'
+import { missingCriticalFields, normalizeEvidence, normalizeInvoice } from './normalize.js'
 import { isSupportedDocument, toImagePages } from './rasterize.js'
 
 // ---------------------------------------------------------------------------
@@ -578,17 +579,6 @@ function sameItem(a: string, b: string): boolean {
   return shared / Math.min(tokensA.length, tokensB.length) >= 0.5
 }
 
-/**
- * Normaliza un código de moneda a ISO de tres letras (mayúsculas); `null` si
- * el valor no parece un código legible. Acepta cualquier código ISO (ARS, USD,
- * EUR, ...): la comparación es igualdad de strings normalizados, sin lista
- * blanca embebida en la lógica.
- */
-export function normalizeCurrency(raw: string): string | null {
-  const code = raw.trim().toUpperCase()
-  return /^[A-Z]{3}$/.test(code) ? code : null
-}
-
 const money = (value: number) => value.toFixed(2)
 
 /**
@@ -604,51 +594,78 @@ const money = (value: number) => value.toFixed(2)
  * puede degradarse a discrepancia o a incertidumbre, nunca al revés.
  */
 export function verifyAgainstEvidence(
-  invoice: InvoiceData,
-  audit: AuditResult,
+  rawInvoice: InvoiceData,
+  rawAudit: AuditResult,
   retrievalScore: number | null = null
 ): AuditResult {
+  // El verificador consume ÚNICAMENTE datos normalizados: los centinelas de
+  // extracción ("" y 0) ya llegaron convertidos en `null` explícito, así que
+  // acá "faltante" y "valor real" no pueden confundirse.
+  const invoice = normalizeInvoice(rawInvoice)
+  const evidence = normalizeEvidence(rawAudit)
+
   const uncertain = (summary: string, confidence = 0.4): AuditResult => ({
-    ...audit,
+    ...rawAudit,
     verdict: 'UNCERTAIN',
-    confidence: Math.min(audit.confidence, confidence),
+    confidence: Math.min(rawAudit.confidence, confidence),
     summary,
     discrepancies: []
   })
+
+  // --- ¿La factura es siquiera auditable? ---------------------------------
+  // Sin identificador, proveedor, total o moneda de la FACTURA no hay
+  // comparación posible. Faltantes no críticos (fecha, PO) no bloquean.
+  const missing = missingCriticalFields(invoice)
+  if (
+    invoice.invoiceNumber === null ||
+    invoice.vendorName === null ||
+    invoice.totalAmount === null ||
+    invoice.currency === null
+  ) {
+    return uncertain(
+      `No se pudo leer ${missing.join(', ')} de la factura; sin esos campos no hay comparación posible.`
+    )
+  }
 
   // --- ¿La evidencia es siquiera de esta factura? -------------------------
   // Se verifica antes que nada: reportar una diferencia contra el documento
   // equivocado es una acusación falsa, peor que no decir nada.
 
-  if (audit.supportDocumentId.trim().length === 0) {
+  if (evidence.supportDocumentId === null) {
     return uncertain(
       'No se identificó un documento de respaldo, así que no hay evidencia para sostener un veredicto.'
     )
   }
+  const supportDocumentId = evidence.supportDocumentId
 
-  const vendorKnown = audit.supportVendorName.trim().length > 0
-  if (vendorKnown && !sameVendor(invoice.vendorName, audit.supportVendorName)) {
+  if (
+    evidence.supportVendorName !== null &&
+    !sameVendor(invoice.vendorName, evidence.supportVendorName)
+  ) {
     return uncertain(
-      `El respaldo recuperado (${audit.supportDocumentId}) es de ${audit.supportVendorName}, no de ${invoice.vendorName}; no corresponde a esta factura.`
+      `El respaldo recuperado (${supportDocumentId}) es de ${evidence.supportVendorName}, no de ${invoice.vendorName}; no corresponde a esta factura.`
     )
   }
 
   // Sin proveedor confirmado y con una recuperación floja, no hay nada sólido.
-  if (!vendorKnown && retrievalScore !== null && retrievalScore < WEAK_RETRIEVAL_SCORE) {
+  if (
+    evidence.supportVendorName === null &&
+    retrievalScore !== null &&
+    retrievalScore < WEAK_RETRIEVAL_SCORE
+  ) {
     return uncertain(
-      `No se pudo confirmar que ${audit.supportDocumentId} corresponda a esta factura (similitud ${retrievalScore.toFixed(2)}).`
+      `No se pudo confirmar que ${supportDocumentId} corresponda a esta factura (similitud ${retrievalScore.toFixed(2)}).`
     )
   }
 
   // Una referencia de PO explícita que no coincide con el respaldo recuperado
   // significa que se está comparando contra otra orden de compra.
-  const poReference = invoice.poReference.trim()
   if (
-    poReference.length > 0 &&
-    !audit.supportDocumentId.toLowerCase().includes(poReference.toLowerCase())
+    invoice.poReference !== null &&
+    !supportDocumentId.toLowerCase().includes(invoice.poReference.toLowerCase())
   ) {
     return uncertain(
-      `La factura referencia ${poReference} pero el respaldo recuperado es ${audit.supportDocumentId}; no se encontró la orden de compra citada.`
+      `La factura referencia ${invoice.poReference} pero el respaldo recuperado es ${supportDocumentId}; no se encontró la orden de compra citada.`
     )
   }
 
@@ -658,25 +675,24 @@ export function verifyAgainstEvidence(
   // conversión necesita un tipo de cambio y una fecha que este sistema no
   // tiene. La comparación es igualdad de códigos normalizados — no depende
   // de ninguna lista de monedas soportadas.
-  const invoiceCurrency = normalizeCurrency(invoice.currency)
-  const supportCurrency = normalizeCurrency(audit.supportCurrency)
+  const currency = invoice.currency
   const currencyNotes: string[] = []
 
-  if (invoiceCurrency !== null && supportCurrency !== null && invoiceCurrency !== supportCurrency) {
+  if (evidence.supportCurrency !== null && evidence.supportCurrency !== currency) {
     return uncertain(
-      `La factura está en ${invoiceCurrency} pero ${audit.supportDocumentId} está en ${supportCurrency}; los montos no son comparables sin una conversión explícita.`
+      `La factura está en ${currency} pero ${supportDocumentId} está en ${evidence.supportCurrency}; los montos no son comparables sin una conversión explícita.`
     )
   }
-  if (supportCurrency === null) {
+  if (evidence.supportCurrency === null) {
     // Sin moneda legible en el respaldo, los chequeos numéricos siguen (los
     // montos podrían igualmente delatar un desvío), pero el resultado lo dice:
     // no se fabrica una moneda que el documento no muestra.
     currencyNotes.push('moneda del respaldo sin verificar')
   }
 
-  if (audit.supportTotalAmount <= 0) {
+  if (evidence.supportTotalAmount === null) {
     return uncertain(
-      `No se pudo leer el total de ${audit.supportDocumentId}; no hay forma de confirmar que la factura coincida.`
+      `No se pudo leer el total de ${supportDocumentId}; no hay forma de confirmar que la factura coincida.`
     )
   }
 
@@ -686,15 +702,15 @@ export function verifyAgainstEvidence(
   const headline: string[] = []
 
   // 1. Totales.
-  const delta = invoice.totalAmount - audit.supportTotalAmount
+  const delta = invoice.totalAmount - evidence.supportTotalAmount
   if (Math.abs(delta) > AMOUNT_EPSILON) {
     discrepancies.push({
       field: 'total',
-      invoiceValue: `${invoice.currency} ${money(invoice.totalAmount)}`,
-      supportValue: `${invoice.currency} ${money(audit.supportTotalAmount)}`,
-      difference: `La factura ${delta > 0 ? 'excede' : 'queda por debajo'} del respaldo en ${money(Math.abs(delta))} ${invoice.currency}.`
+      invoiceValue: `${currency} ${money(invoice.totalAmount)}`,
+      supportValue: `${currency} ${money(evidence.supportTotalAmount)}`,
+      difference: `La factura ${delta > 0 ? 'excede' : 'queda por debajo'} del respaldo en ${money(Math.abs(delta))} ${currency}.`
     })
-    headline.push(`el total difiere en ${money(Math.abs(delta))} ${invoice.currency}`)
+    headline.push(`el total difiere en ${money(Math.abs(delta))} ${currency}`)
   }
 
   // 2. Coherencia interna de la factura: los ítems deben sumar el total.
@@ -718,7 +734,7 @@ export function verifyAgainstEvidence(
         field: 'coherencia interna',
         invoiceValue: `total ${money(invoice.totalAmount)}`,
         supportValue: `ítems suman ${money(itemsSum)}`,
-        difference: `La factura cobra ${money(Math.abs(internalDelta))} ${invoice.currency} ${internalDelta > 0 ? 'más' : 'menos'} de lo que detalla en sus ítems.`
+        difference: `La factura cobra ${money(Math.abs(internalDelta))} ${currency} ${internalDelta > 0 ? 'más' : 'menos'} de lo que detalla en sus ítems.`
       })
       headline.push('los ítems no suman el total facturado')
     }
@@ -728,7 +744,7 @@ export function verifyAgainstEvidence(
   const unmatchedInvoice = [...invoice.items]
   const onlyOnSupport: string[] = []
 
-  for (const supportItem of audit.supportItems) {
+  for (const supportItem of evidence.supportItems) {
     const index = unmatchedInvoice.findIndex((item) =>
       sameItem(item.description, supportItem.description)
     )
@@ -738,7 +754,7 @@ export function verifyAgainstEvidence(
       discrepancies.push({
         field: `ítem no facturado: ${supportItem.description}`,
         invoiceValue: 'ausente',
-        supportValue: `${invoice.currency} ${money(supportItem.amount)}`,
+        supportValue: `${currency} ${money(supportItem.amount)}`,
         difference: 'El respaldo autoriza este ítem pero la factura no lo detalla.'
       })
       continue
@@ -769,7 +785,7 @@ export function verifyAgainstEvidence(
   for (const extra of unmatchedInvoice) {
     discrepancies.push({
       field: `ítem no autorizado: ${extra.description}`,
-      invoiceValue: `${invoice.currency} ${money(extra.amount)}`,
+      invoiceValue: `${currency} ${money(extra.amount)}`,
       supportValue: 'ausente',
       difference: 'Se factura un ítem que el respaldo no autoriza.'
     })
@@ -785,14 +801,14 @@ export function verifyAgainstEvidence(
   if (discrepancies.length === 0) {
     // La evidencia respalda una coincidencia. Se conserva el resumen del
     // modelo, que suele redactarlo mejor que una plantilla.
-    return { ...audit, verdict: 'MATCH', discrepancies: [], summary: `${audit.summary}${caveat}` }
+    return { ...rawAudit, verdict: 'MATCH', discrepancies: [], summary: `${rawAudit.summary}${caveat}` }
   }
 
   return {
-    ...audit,
+    ...rawAudit,
     verdict: 'DISCREPANCY',
     confidence: 0.99,
-    summary: `Contra ${audit.supportDocumentId}: ${headline.join(' y ')}.${caveat}`,
+    summary: `Contra ${supportDocumentId}: ${headline.join(' y ')}.${caveat}`,
     discrepancies
   }
 }

@@ -21,6 +21,13 @@ import {
   verifyAgainstEvidence
 } from './services/qvacService.js'
 import {
+  missingCriticalFields,
+  normalizeAmount,
+  normalizeCurrency,
+  normalizeInvoice,
+  normalizeText
+} from './services/normalize.js'
+import {
   AUDIT_JSON_SCHEMA,
   AuditResultSchema,
   INVOICE_JSON_SCHEMA,
@@ -476,6 +483,99 @@ await test('una variación menor de OCR no convierte un ítem en faltante', () =
     0.88
   )
   assert.equal(result.verdict, 'MATCH', `descripciones equivalentes se trataron como distintas`)
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nNormalización de valores faltantes (centinelas "" y 0 → null)')
+
+await test('los centinelas de texto y monto se convierten en null explícito', () => {
+  assert.equal(normalizeText(''), null)
+  assert.equal(normalizeText('   '), null)
+  assert.equal(normalizeText(' PO-5001 '), 'PO-5001')
+  // Un total de exactamente 0 es evidencia ilegible, no una factura de 0,00:
+  // decisión conservadora documentada en normalize.ts.
+  assert.equal(normalizeAmount(0), null)
+  assert.equal(normalizeAmount(-5), null)
+  assert.equal(normalizeAmount(Number.NaN), null)
+  assert.equal(normalizeAmount(1840), 1840)
+})
+
+await test('la moneda se normaliza a ISO de tres letras o null', () => {
+  assert.equal(normalizeCurrency(' usd '), 'USD')
+  assert.equal(normalizeCurrency('ARS'), 'ARS')
+  assert.equal(normalizeCurrency('eur'), 'EUR')
+  assert.equal(normalizeCurrency(''), null)
+  assert.equal(normalizeCurrency('$'), null)
+  assert.equal(normalizeCurrency('dolares'), null)
+})
+
+await test('missingCriticalFields nombra exactamente lo que falta', () => {
+  const complete = normalizeInvoice(invoiceOf('Acme', 'PO-5001', 100, []))
+  assert.deepEqual(missingCriticalFields(complete), [])
+
+  const broken = normalizeInvoice({
+    invoiceNumber: '',
+    vendorName: 'Acme',
+    date: '',
+    totalAmount: 0,
+    currency: 'USD',
+    poReference: '',
+    items: []
+  })
+  assert.deepEqual(missingCriticalFields(broken), ['invoiceNumber', 'totalAmount'])
+})
+
+await test('un total de factura ilegible (0) da UNCERTAIN nombrando el campo', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 0, []),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.deepEqual(result.discrepancies, [])
+  assert.ok(result.summary.includes('totalAmount'), `debe nombrar el campo faltante: ${result.summary}`)
+})
+
+await test('un proveedor de factura ilegible da UNCERTAIN, no una comparación a ciegas', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('', 'PO-5001', 1840, []),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.ok(result.summary.includes('vendorName'))
+})
+
+await test('una moneda de factura ilegible da UNCERTAIN nombrando el campo', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 1840, [], ''),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.ok(result.summary.includes('currency'), `debe nombrar la moneda faltante: ${result.summary}`)
+})
+
+await test('fecha y PO faltantes NO bloquean por sí solos el veredicto', () => {
+  // Campos no críticos: la factura sin fecha ni PO citado todavía se compara.
+  const items = [item('A4 Copy Paper, 80gsm, ream', 40, 6.5)]
+  const invoice = { ...invoiceOf('Acme Office Supplies LLC', '', 260, items), date: '' }
+  const result = verifyAgainstEvidence(
+    invoice,
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items),
+    0.88
+  )
+  assert.equal(result.verdict, 'MATCH')
+})
+
+await test('una factura sin ítems detallados aún permite comparar totales', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 2000, []),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(result.discrepancies.some((d) => d.field === 'total'))
 })
 
 // ---------------------------------------------------------------------------
