@@ -345,7 +345,10 @@ export async function indexSupportDocuments(
       modelId,
       documents,
       workspace,
-      chunkOpts: { chunkSize: 512, chunkOverlap: 64, chunkStrategy: 'paragraph' },
+      // Una orden de compra es una unidad atómica de pocos cientos de
+      // caracteres. Con trozos chicos, el total puede caer en un fragmento
+      // distinto al de los ítems y el auditor nunca llega a verlo junto.
+      chunkOpts: { chunkSize: 2048, chunkOverlap: 128, chunkStrategy: 'paragraph' },
       progressInterval: 100,
       onProgress: (stage, current, total) => {
         onProgress({ stage: 'index', message: `RAG ${stage}`, current, total })
@@ -478,26 +481,150 @@ Reglas:
 - El OCR puede traer errores; si un campo es ilegible, usá "" para texto y 0 para números.
 /no_think`
 
-const AUDIT_SYSTEM = `Sos un auditor de cuentas a pagar. Comparás una factura ya extraída contra el documento de respaldo recuperado (típicamente una orden de compra) y emitís un veredicto en JSON.
+const AUDIT_SYSTEM = `Sos un auditor de cuentas a pagar. Comparás una factura ya extraída contra el documento de respaldo recuperado (típicamente una orden de compra) y devolvés un único objeto JSON.
+
+Completá los campos EN ORDEN. Los primeros son evidencia: transcribilos del texto antes de emitir ningún juicio.
+
+1. "supportDocumentId": el identificador del respaldo recuperado, por ejemplo "PO-5003". Si ninguno de los fragmentos recuperados corresponde a esta factura, usá "".
+2. "supportTotalAmount": el TOTAL impreso en ese documento de respaldo, como número. Buscalo en el texto y copialo. Si no lo encontrás, usá 0. No lo estimes ni lo deduzcas del total de la factura.
+3. "invoiceTotalAmount": el total de la factura, copiado del JSON que recibís.
+4. "itemsOnlyOnInvoice": descripciones de ítems que aparecen en la factura y NO en el respaldo.
+5. "itemsOnlyOnSupport": descripciones de ítems que aparecen en el respaldo y NO en la factura. Compará la lista de ítems de los dos documentos, uno por uno.
+6. "discrepancies": una entrada por cada diferencia concreta que puedas citar (total distinto, precio unitario distinto, cantidad distinta, ítem faltante o de más).
+7. "verdict", 8. "confidence", 9. "summary": recién ahora, y consistentes con lo que escribiste arriba.
 
 Veredictos:
-- "MATCH": el respaldo corresponde a esta factura y coinciden proveedor, ítems, cantidades, precios unitarios y total.
-- "DISCREPANCY": el respaldo corresponde a esta factura pero hay al menos una diferencia concreta y verificable.
+- "MATCH": el respaldo corresponde a esta factura y coinciden proveedor, ítems, cantidades, precios unitarios y total. Sólo si "discrepancies" quedó vacío.
+- "DISCREPANCY": el respaldo corresponde a esta factura pero hay al menos una diferencia concreta.
 - "UNCERTAIN": no hay evidencia suficiente para decidir.
 
-Marcá "UNCERTAIN" —no adivines— cuando:
-- no se recuperó ningún documento de respaldo, o el recuperado es de otro proveedor u otra orden de compra;
-- el texto del OCR está demasiado incompleto o corrupto para comparar montos o ítems;
-- la factura no referencia ninguna orden de compra y nada en el respaldo permite vincularla con certeza.
+Marcá "UNCERTAIN" —no adivines— cuando no se recuperó respaldo, cuando el recuperado es de otro proveedor u otra orden de compra, o cuando el OCR está demasiado corrupto para comparar montos.
 
-Inventar una coincidencia es un error mucho más grave que admitir incertidumbre.
+Dos advertencias, que son los errores más caros de esta tarea:
+- Que los totales coincidan NO alcanza para MATCH. Una entrega parcial facturada por el monto completo tiene el mismo total y le falta un ítem. Compará siempre las listas de ítems.
+- Inventar una coincidencia es mucho más grave que admitir incertidumbre. Si no pudiste leer el total del respaldo, no declares MATCH.
 
-Reglas de salida:
-- "confidence" va entre 0 y 1 y refleja tu certeza real sobre el veredicto.
-- "summary" es UNA sola frase que un auditor humano pueda leer en menos de cinco segundos.
-- "discrepancies" lista una entrada por diferencia concreta, citando los valores de ambos documentos. Si el veredicto es MATCH, va vacío.
-- Toda diferencia que reportes tiene que estar respaldada por el texto; no reportes diferencias que no puedas citar.
+"summary" es UNA sola frase que un auditor humano lea en menos de cinco segundos.
 /no_think`
+
+/** Tolerancia de comparación de montos: por debajo de un centavo es redondeo. */
+const AMOUNT_EPSILON = 0.01
+
+/**
+ * Contrasta el veredicto del modelo contra la aritmética y corrige lo que el
+ * modelo haya pasado por alto.
+ *
+ * El modelo propone, la aritmética dispone. Un LLM de 4B puede leer bien los
+ * dos totales y aun así declarar "todo coincide"; comparar dos números, en
+ * cambio, es exacto y gratis. Así que todo lo que sea verificable se verifica
+ * en código, y sólo lo que exige criterio queda en manos del modelo.
+ *
+ * Las correcciones son siempre en la dirección conservadora: una coincidencia
+ * puede degradarse a discrepancia o a incertidumbre, nunca al revés.
+ */
+export function applyArithmeticGuard(invoice: InvoiceData, audit: AuditResult): AuditResult {
+  const discrepancies = [...audit.discrepancies]
+  const notes: string[] = []
+
+  // Sin respaldo no hay nada contra qué auditar, diga lo que diga el modelo.
+  if (audit.supportDocumentId.trim().length === 0) {
+    return {
+      ...audit,
+      verdict: 'UNCERTAIN',
+      confidence: Math.min(audit.confidence, 0.5),
+      summary:
+        audit.verdict === 'UNCERTAIN'
+          ? audit.summary
+          : 'No se identificó un documento de respaldo, así que no hay evidencia para sostener un veredicto.',
+      discrepancies
+    }
+  }
+
+  // El total del respaldo es ilegible: no se puede confirmar una coincidencia.
+  if (audit.supportTotalAmount <= 0) {
+    return {
+      ...audit,
+      verdict: audit.verdict === 'DISCREPANCY' ? 'DISCREPANCY' : 'UNCERTAIN',
+      confidence: Math.min(audit.confidence, 0.5),
+      summary:
+        audit.verdict === 'DISCREPANCY'
+          ? audit.summary
+          : `No se pudo leer el total de ${audit.supportDocumentId}; no hay forma de confirmar que la factura coincida.`,
+      discrepancies
+    }
+  }
+
+  const delta = invoice.totalAmount - audit.supportTotalAmount
+  const totalsDiffer = Math.abs(delta) > AMOUNT_EPSILON
+
+  if (totalsDiffer) {
+    const alreadyReported = discrepancies.some((d) => /total/i.test(d.field))
+    if (!alreadyReported) {
+      discrepancies.push({
+        field: 'totalAmount',
+        invoiceValue: invoice.totalAmount.toFixed(2),
+        supportValue: audit.supportTotalAmount.toFixed(2),
+        difference: `La factura excede el respaldo en ${delta.toFixed(2)} ${invoice.currency}.`
+      })
+    }
+    notes.push(
+      `el total difiere en ${Math.abs(delta).toFixed(2)} ${invoice.currency} (${invoice.totalAmount.toFixed(2)} vs ${audit.supportTotalAmount.toFixed(2)})`
+    )
+  }
+
+  // Un ítem que aparece de un solo lado es una discrepancia aunque los totales
+  // cierren: es justo el caso de la entrega parcial facturada como completa.
+  for (const item of audit.itemsOnlyOnInvoice) {
+    discrepancies.push({
+      field: `ítem sólo en la factura: ${item}`,
+      invoiceValue: item,
+      supportValue: 'ausente',
+      difference: 'Se factura un ítem que el documento de respaldo no autoriza.'
+    })
+  }
+  for (const item of audit.itemsOnlyOnSupport) {
+    discrepancies.push({
+      field: `ítem sólo en el respaldo: ${item}`,
+      invoiceValue: 'ausente',
+      supportValue: item,
+      difference: 'El respaldo incluye un ítem que la factura no detalla.'
+    })
+  }
+
+  const itemsDiffer = audit.itemsOnlyOnInvoice.length + audit.itemsOnlyOnSupport.length > 0
+  if (itemsDiffer) {
+    notes.push(
+      `${audit.itemsOnlyOnInvoice.length + audit.itemsOnlyOnSupport.length} ítem(s) no se corresponden entre ambos documentos`
+    )
+  }
+
+  if (!totalsDiffer && !itemsDiffer) {
+    // La aritmética no contradice al modelo: se respeta su veredicto.
+    return { ...audit, discrepancies }
+  }
+
+  // La aritmética prueba una diferencia. Si el modelo dijo MATCH, se corrige y
+  // se reescribe el resumen para que el auditor lea el hecho, no la opinión.
+  const overridden = audit.verdict !== 'DISCREPANCY'
+  return {
+    ...audit,
+    verdict: 'DISCREPANCY',
+    confidence: overridden ? 0.99 : Math.max(audit.confidence, 0.9),
+    summary: overridden
+      ? `Contra ${audit.supportDocumentId}: ${notes.join(' y ')}.`
+      : audit.summary,
+    discrepancies
+  }
+}
+
+/**
+ * Recupera el nombre de archivo que se antepuso al contenido durante la
+ * indexación, para poder nombrar el respaldo en el reporte.
+ */
+export function supportLabel(chunkContent: string): string | null {
+  const match = /^\s*\[([^\]]+)\]/.exec(chunkContent)
+  return match?.[1] ?? null
+}
 
 /** Recorta el contexto para que la ventana del modelo no se desborde. */
 function clip(text: string, max: number): string {
@@ -595,6 +722,10 @@ export async function extractAndAudit(
 
         const invoice = extraction.data
         const best = input.hits[0] ?? null
+        // El id que devuelve la búsqueda es un UUID interno, inservible para un
+        // auditor. El nombre real del archivo viaja como prefijo del contenido,
+        // que es justamente para lo que se antepuso al indexar.
+        const bestLabel = best !== null ? (supportLabel(best.content) ?? best.id) : null
         const supportContext =
           input.hits.length > 0
             ? input.hits
@@ -642,12 +773,17 @@ export async function extractAndAudit(
             status: 'OK',
             invoice,
             audit: {
+              supportDocumentId: bestLabel ?? '',
+              supportTotalAmount: 0,
+              invoiceTotalAmount: invoice.totalAmount,
+              itemsOnlyOnInvoice: [],
+              itemsOnlyOnSupport: [],
+              discrepancies: [],
               verdict: 'UNCERTAIN',
               confidence: 0,
-              summary: `El modelo de auditoría no produjo un veredicto válido: ${audit.error}`,
-              discrepancies: []
+              summary: `El modelo de auditoría no produjo un veredicto válido: ${audit.error}`
             },
-            matchedSupportDoc: best?.id ?? null,
+            matchedSupportDoc: bestLabel,
             supportScore: best?.score ?? null,
             error: audit.error,
             timings,
@@ -660,8 +796,8 @@ export async function extractAndAudit(
           file: name,
           status: 'OK',
           invoice,
-          audit: audit.data,
-          matchedSupportDoc: best?.id ?? null,
+          audit: applyArithmeticGuard(invoice, audit.data),
+          matchedSupportDoc: bestLabel,
           supportScore: best?.score ?? null,
           error: null,
           timings,

@@ -47,7 +47,7 @@ npm run cli -- --json
 Chequeos rápidos, sin necesidad de descargar los modelos:
 
 ```bash
-npm run verify     # 14 pruebas de rasterización, OCR, RAG y schemas
+npm run verify     # 24 pruebas de rasterización, OCR, RAG, schemas y guardia aritmético
 npm run typecheck
 ```
 
@@ -84,6 +84,18 @@ El pipeline corre en **tres fases secuenciales, con un solo modelo grande vivo p
 Por eso la búsqueda RAG ocurre en la fase 2 y no dentro de la auditoría: recuperar durante la fase 3 exigiría tener el modelo de embeddings y el LLM cargados al mismo tiempo, que es exactamente lo que el presupuesto de memoria prohíbe.
 
 **La ruta principal es OCR → texto plano → LLM de texto.** No depende de que entre un modelo multimodal en memoria; el multimodal queda como mejora opcional, no como requisito.
+
+### El modelo propone, la aritmética dispone
+
+La primera corrida real contra `samples/` devolvió **5 MATCH y 0 discrepancias**: el auditor no detectó ninguna de las tres diferencias plantadas. La causa era el orden del schema. La gramática GBNF emite las claves en el orden en que están declaradas, y `verdict` estaba primero — el modelo quedaba obligado a comprometerse con un veredicto antes de haber leído un solo número del respaldo.
+
+El arreglo tiene dos partes:
+
+1. **Evidencia antes del veredicto.** El schema de auditoría ahora declara `supportDocumentId`, `supportTotalAmount`, `invoiceTotalAmount`, `itemsOnlyOnInvoice`, `itemsOnlyOnSupport` y `discrepancies` *antes* de `verdict`. La gramática obliga al modelo a transcribir los valores de los dos documentos y a enumerar las diferencias antes de poder emitir el juicio.
+
+2. **Un guardia aritmético determinista.** Comparar dos números es exacto y gratis; un LLM de 4B puede leer bien ambos totales y aun así declarar que todo coincide. Así que `applyArithmeticGuard()` contrasta el veredicto contra la aritmética y corrige lo que haga falta, siempre en dirección conservadora: un `MATCH` puede degradarse a `DISCREPANCY` o a `UNCERTAIN`, nunca al revés. Si el total de la factura difiere del respaldo, o si algún ítem aparece de un solo lado, el veredicto es `DISCREPANCY` sin importar lo que haya opinado el modelo. Y si el OCR no pudo leer el total del respaldo, no se permite declarar coincidencia.
+
+El segundo punto es lo que hace demostrable el caso más difícil (INV-1004): ahí los totales **coinciden** —se factura el monto completo por una entrega parcial— y sólo la comparación de listas de ítems delata el faltante.
 
 ### Manejo de incertidumbre
 

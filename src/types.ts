@@ -58,13 +58,33 @@ export const DiscrepancyReportSchema = z.object({
 
 export type DiscrepancyReport = z.infer<typeof DiscrepancyReportSchema>
 
+/**
+ * Resultado de auditoría, **con la evidencia antes del veredicto**.
+ *
+ * El orden de las propiedades no es cosmético: llama.cpp compila el JSON Schema
+ * a una gramática GBNF que emite las claves en el orden del schema, así que el
+ * modelo está obligado a transcribir los valores del respaldo y a enumerar las
+ * diferencias antes de poder escribir el token del veredicto. Con `verdict`
+ * primero, el modelo se compromete a un juicio antes de haber mirado un solo
+ * número — y ahí es donde alucina coincidencias.
+ */
 export const AuditResultSchema = z.object({
+  /** Identificador del respaldo recuperado, p. ej. "PO-5003"; "" si no hay. */
+  supportDocumentId: z.string(),
+  /** Total leído del documento de respaldo; 0 si no se pudo leer. */
+  supportTotalAmount: z.number(),
+  /** Total de la factura, copiado del JSON extraído. */
+  invoiceTotalAmount: z.number(),
+  /** Ítems facturados que no figuran en el respaldo. */
+  itemsOnlyOnInvoice: z.array(z.string()),
+  /** Ítems del respaldo que la factura no incluye. */
+  itemsOnlyOnSupport: z.array(z.string()),
+  discrepancies: z.array(DiscrepancyReportSchema),
   verdict: VerdictSchema,
   /** Confianza del modelo en su propio veredicto, de 0 a 1. */
   confidence: z.number(),
   /** Una sola frase: lo que un auditor necesita leer en menos de 5 segundos. */
-  summary: z.string(),
-  discrepancies: z.array(DiscrepancyReportSchema)
+  summary: z.string()
 })
 
 export type AuditResult = z.infer<typeof AuditResultSchema>

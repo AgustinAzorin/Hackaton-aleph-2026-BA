@@ -13,7 +13,13 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { toImagePages, isSupportedDocument } from './services/rasterize.js'
-import { blocksToText, buildRetrievalQuery, listDocuments } from './services/qvacService.js'
+import {
+  applyArithmeticGuard,
+  blocksToText,
+  buildRetrievalQuery,
+  listDocuments,
+  supportLabel
+} from './services/qvacService.js'
 import {
   AUDIT_JSON_SCHEMA,
   AuditResultSchema,
@@ -210,6 +216,162 @@ await test('zod rechaza un veredicto fuera del enum', () => {
     discrepancies: []
   })
   assert.equal(result.success, false)
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nGuardia aritmético (los tres casos que el modelo pasó por alto)')
+
+const baseInvoice = {
+  invoiceNumber: 'INV-0000',
+  vendorName: 'Proveedor',
+  date: '2026-07-01',
+  totalAmount: 0,
+  currency: 'USD',
+  poReference: 'PO-0000',
+  items: []
+}
+
+/** Auditoría "todo bien" como la que devolvió el modelo en la primera corrida. */
+const modelSaysMatch = {
+  supportDocumentId: 'PO-0000',
+  supportTotalAmount: 0,
+  invoiceTotalAmount: 0,
+  itemsOnlyOnInvoice: [] as string[],
+  itemsOnlyOnSupport: [] as string[],
+  discrepancies: [],
+  verdict: 'MATCH' as const,
+  confidence: 0.95,
+  summary: 'Todo coincide.'
+}
+
+await test('INV-1003: total inflado corrige un MATCH a DISCREPANCY', () => {
+  const result = applyArithmeticGuard(
+    { ...baseInvoice, totalAmount: 4620 },
+    { ...modelSaysMatch, supportDocumentId: 'PO-5003.pdf', supportTotalAmount: 4200 }
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(
+    result.discrepancies.some((d) => d.field === 'totalAmount'),
+    'no se agregó la discrepancia de total'
+  )
+  assert.ok(result.summary.includes('420.00'), `el resumen no cita la diferencia: ${result.summary}`)
+})
+
+await test('INV-1006: precio unitario inflado corrige un MATCH a DISCREPANCY', () => {
+  const result = applyArithmeticGuard(
+    { ...baseInvoice, totalAmount: 915 },
+    { ...modelSaysMatch, supportDocumentId: 'PO-5006.pdf', supportTotalAmount: 840 }
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+})
+
+await test('INV-1004: totales iguales pero falta un ítem, igual es DISCREPANCY', () => {
+  // El caso más difícil: la aritmética de totales cierra y sólo la comparación
+  // de ítems delata la entrega parcial facturada como completa.
+  const result = applyArithmeticGuard(
+    { ...baseInvoice, totalAmount: 2980 },
+    {
+      ...modelSaysMatch,
+      supportDocumentId: 'PO-5004.pdf',
+      supportTotalAmount: 2980,
+      itemsOnlyOnSupport: ['Cordless drill 18V']
+    }
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(
+    result.discrepancies.some((d) => d.field.includes('Cordless drill 18V')),
+    'no se reportó el ítem faltante'
+  )
+})
+
+await test('una coincidencia real se mantiene MATCH', () => {
+  const result = applyArithmeticGuard(
+    { ...baseInvoice, totalAmount: 1840 },
+    { ...modelSaysMatch, supportDocumentId: 'PO-5001.pdf', supportTotalAmount: 1840 }
+  )
+  assert.equal(result.verdict, 'MATCH')
+  assert.deepEqual(result.discrepancies, [])
+})
+
+await test('diferencias de centavo se toleran como redondeo', () => {
+  const result = applyArithmeticGuard(
+    { ...baseInvoice, totalAmount: 1840.004 },
+    { ...modelSaysMatch, supportDocumentId: 'PO-5001.pdf', supportTotalAmount: 1840 }
+  )
+  assert.equal(result.verdict, 'MATCH')
+})
+
+await test('sin respaldo identificado el veredicto cae a UNCERTAIN', () => {
+  const result = applyArithmeticGuard(
+    { ...baseInvoice, totalAmount: 3835 },
+    { ...modelSaysMatch, supportDocumentId: '', supportTotalAmount: 0 }
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+})
+
+await test('un total de respaldo ilegible impide declarar MATCH', () => {
+  // Si el OCR no pudo leer el total del PO, no hay con qué confirmar nada.
+  const result = applyArithmeticGuard(
+    { ...baseInvoice, totalAmount: 1840 },
+    { ...modelSaysMatch, supportDocumentId: 'PO-5001.pdf', supportTotalAmount: 0 }
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+})
+
+await test('no pisa una discrepancia que el modelo ya había detectado', () => {
+  const result = applyArithmeticGuard(
+    { ...baseInvoice, totalAmount: 4620 },
+    {
+      ...modelSaysMatch,
+      supportDocumentId: 'PO-5003.pdf',
+      supportTotalAmount: 4200,
+      verdict: 'DISCREPANCY',
+      summary: 'Recargo de combustible no autorizado.',
+      discrepancies: [
+        {
+          field: 'totalAmount',
+          invoiceValue: '4620.00',
+          supportValue: '4200.00',
+          difference: 'Recargo de 420.00 no autorizado.'
+        }
+      ]
+    }
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.equal(result.summary, 'Recargo de combustible no autorizado.')
+  assert.equal(result.discrepancies.length, 1, 'duplicó la discrepancia de total')
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nEtiqueta del documento de respaldo')
+
+await test('recupera el nombre de archivo del prefijo del fragmento', () => {
+  assert.equal(supportLabel('[PO-5003.pdf]\nPURCHASE ORDER\nTOTAL USD 4,200.00'), 'PO-5003.pdf')
+  assert.equal(supportLabel('sin prefijo alguno'), null)
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nOrden del schema de auditoría')
+
+await test('la evidencia precede al veredicto en el JSON Schema', () => {
+  // Es el arreglo central: la gramática GBNF emite las claves en el orden del
+  // schema, así que el veredicto no puede salir antes que la evidencia.
+  const schema = AUDIT_JSON_SCHEMA as { properties: Record<string, unknown> }
+  const keys = Object.keys(schema.properties)
+  const verdictAt = keys.indexOf('verdict')
+  for (const evidence of [
+    'supportDocumentId',
+    'supportTotalAmount',
+    'invoiceTotalAmount',
+    'itemsOnlyOnInvoice',
+    'itemsOnlyOnSupport',
+    'discrepancies'
+  ]) {
+    assert.ok(
+      keys.indexOf(evidence) < verdictAt,
+      `${evidence} debe emitirse antes que verdict, pero sale después`
+    )
+  }
 })
 
 // ---------------------------------------------------------------------------
