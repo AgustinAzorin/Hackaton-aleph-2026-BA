@@ -272,6 +272,46 @@ await test('INV-1001: coincidencia real se mantiene MATCH', () => {
   assert.deepEqual(result.discrepancies, [])
 })
 
+await test('INV-1002: coincidencia exacta con decimales se mantiene MATCH', () => {
+  const items = [
+    item('Hex Bolt M12 x 60mm, box of 100', 25, 78),
+    item('Lock Washer M12, box of 500', 15, 22.7),
+    item('Threadlocker adhesive 50ml', 12, 82.5)
+  ]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Bolt & Nut Co.', 'PO-5002', 3280.5, items),
+    supportOf('PO-5002.pdf', 'Bolt & Nut Co.', 3280.5, items),
+    0.886
+  )
+  assert.equal(result.verdict, 'MATCH')
+  assert.deepEqual(result.discrepancies, [])
+})
+
+await test('un renglón mal leído por el OCR no dispara una acusación falsa', () => {
+  // Caso real de la tercera corrida: la extracción leyó mal un importe y el
+  // chequeo de coherencia interna reportó un desvío de 1.500 que no existía.
+  // Si el importe de un renglón no cierra con cantidad × precio, el que no es
+  // confiable es el OCR, no la factura.
+  const invoiceItems = [
+    item('Container drayage, port to warehouse', 6, 520),
+    { description: 'Palletizing service', quantity: 12, unitPrice: 90, amount: 2580 },
+    item('Fuel surcharge', 1, 420)
+  ]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 4620, invoiceItems),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 4620, [
+      item('Container drayage, port to warehouse', 6, 520),
+      item('Palletizing service', 12, 90),
+      item('Fuel surcharge', 1, 420)
+    ]),
+    0.859
+  )
+  assert.ok(
+    !result.discrepancies.some((d) => d.field === 'coherencia interna'),
+    'acusó a la factura por un renglón que el OCR leyó mal'
+  )
+})
+
 await test('INV-1003: recargo no autorizado da DISCREPANCY', () => {
   const supportItems = [
     item('Container drayage, port to warehouse', 6, 520),
@@ -293,8 +333,8 @@ await test('INV-1003: recargo no autorizado da DISCREPANCY', () => {
 
 await test('INV-1004: totales iguales, pero falta un ítem del respaldo', () => {
   // El caso que el modelo no detectó dos corridas seguidas. Los totales
-  // coinciden en 2980, así que sólo lo delatan el cruce de ítems y el hecho
-  // de que los ítems facturados no sumen el total.
+  // coinciden en 2920, así que sólo lo delatan el cruce de ítems y el hecho
+  // de que los ítems facturados sumen 2100 contra un total de 2920.
   const invoiceItems = [
     item('Circular saw blade 190mm', 20, 34),
     item('Safety goggles, polycarbonate', 60, 11),
@@ -302,8 +342,8 @@ await test('INV-1004: totales iguales, pero falta un ítem del respaldo', () => 
   ]
   const supportItems = [...invoiceItems, item('Cordless drill 18V', 4, 205)]
   const result = verifyAgainstEvidence(
-    invoiceOf('Cedar Hardware Supply', 'PO-5004', 2980, invoiceItems),
-    supportOf('PO-5004.pdf', 'Cedar Hardware Supply', 2980, supportItems),
+    invoiceOf('Cedar Hardware Supply', 'PO-5004', 2920, invoiceItems),
+    supportOf('PO-5004.pdf', 'Cedar Hardware Supply', 2920, supportItems),
     0.885
   )
   assert.equal(result.verdict, 'DISCREPANCY')

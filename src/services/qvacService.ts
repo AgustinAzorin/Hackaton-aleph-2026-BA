@@ -666,7 +666,17 @@ export function verifyAgainstEvidence(
   // 2. Coherencia interna de la factura: los ítems deben sumar el total.
   //    Una entrega parcial facturada por el monto completo se delata acá sola,
   //    sin necesidad de mirar el respaldo.
-  if (invoice.items.length > 0) {
+  //
+  //    Pero este chequeo compara dos números que salen del MISMO OCR, así que
+  //    un renglón mal leído produciría una acusación falsa. Sólo se corre si
+  //    cada renglón es internamente coherente — importe igual a cantidad por
+  //    precio unitario. Si algún renglón no cierra, el que no es confiable es
+  //    el OCR, no la factura, y no se acusa a nadie.
+  const linesAreTrustworthy = invoice.items.every(
+    (item) => Math.abs(item.amount - item.quantity * item.unitPrice) <= AMOUNT_EPSILON
+  )
+
+  if (invoice.items.length > 0 && linesAreTrustworthy) {
     const itemsSum = invoice.items.reduce((sum, item) => sum + item.amount, 0)
     const internalDelta = invoice.totalAmount - itemsSum
     if (Math.abs(internalDelta) > AMOUNT_EPSILON) {
@@ -676,7 +686,7 @@ export function verifyAgainstEvidence(
         supportValue: `ítems suman ${money(itemsSum)}`,
         difference: `La factura cobra ${money(Math.abs(internalDelta))} ${invoice.currency} ${internalDelta > 0 ? 'más' : 'menos'} de lo que detalla en sus ítems.`
       })
-      headline.push(`los ítems no suman el total facturado`)
+      headline.push('los ítems no suman el total facturado')
     }
   }
 
@@ -694,7 +704,7 @@ export function verifyAgainstEvidence(
       discrepancies.push({
         field: `ítem no facturado: ${supportItem.description}`,
         invoiceValue: 'ausente',
-        supportValue: `${supportItem.quantity} × ${money(supportItem.unitPrice)}`,
+        supportValue: `${invoice.currency} ${money(supportItem.amount)}`,
         difference: 'El respaldo autoriza este ítem pero la factura no lo detalla.'
       })
       continue
@@ -725,7 +735,7 @@ export function verifyAgainstEvidence(
   for (const extra of unmatchedInvoice) {
     discrepancies.push({
       field: `ítem no autorizado: ${extra.description}`,
-      invoiceValue: `${extra.quantity} × ${money(extra.unitPrice)}`,
+      invoiceValue: `${invoice.currency} ${money(extra.amount)}`,
       supportValue: 'ausente',
       difference: 'Se factura un ítem que el respaldo no autoriza.'
     })

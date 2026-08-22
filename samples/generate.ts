@@ -43,6 +43,12 @@ interface Doc {
   printedTotal: number
   currency: string
   notes?: string
+  /**
+   * Marca el único caso en que el total impreso NO coincide con la suma de los
+   * ítems a propósito: la entrega parcial facturada por el monto completo.
+   * Sin esta marca, la autoverificación de abajo rechaza el documento.
+   */
+  intentionalTotalMismatch?: true
 }
 
 const money = (n: number, currency: string) =>
@@ -185,7 +191,7 @@ const PO_5002: Doc = {
     { description: 'Lock Washer M12, box of 500', quantity: 15, unitPrice: 22.7 },
     { description: 'Threadlocker adhesive 50ml', quantity: 12, unitPrice: 82.5 }
   ],
-  printedTotal: 3275.5
+  printedTotal: 3280.5
 }
 
 const INV_1002: Doc = {
@@ -201,7 +207,7 @@ const INV_1002: Doc = {
     { description: 'Lock Washer M12, box of 500', quantity: 15, unitPrice: 22.7 },
     { description: 'Threadlocker adhesive 50ml', quantity: 12, unitPrice: 82.5 }
   ],
-  printedTotal: 3275.5
+  printedTotal: 3280.5
 }
 
 /** PO-5003 / INV-1003 — DISCREPANCIA: sobrefacturación de flete (+420.00). */
@@ -252,7 +258,7 @@ const PO_5004: Doc = {
     { description: 'Work gloves, leather, pair', quantity: 80, unitPrice: 9.5 },
     { description: 'Cordless drill 18V', quantity: 4, unitPrice: 205.0 }
   ],
-  printedTotal: 2980.0
+  printedTotal: 2920.0
 }
 
 const INV_1004: Doc = {
@@ -268,7 +274,10 @@ const INV_1004: Doc = {
     { description: 'Safety goggles, polycarbonate', quantity: 60, unitPrice: 11.0 },
     { description: 'Work gloves, leather, pair', quantity: 80, unitPrice: 9.5 }
   ],
-  printedTotal: 2980.0,
+  // Los ítems detallados suman 2.100 pero se factura el total completo del PO:
+  // ésta es la discrepancia plantada, y es deliberada.
+  printedTotal: 2920.0,
+  intentionalTotalMismatch: true,
   notes: 'Cordless drill 18V backordered; billed in full per contract terms.'
 }
 
@@ -323,12 +332,43 @@ const EXPECTED = [
   ['INV-1001', 'PO-5001', 'MATCH', 'Ítems, cantidades y total idénticos.'],
   ['INV-1002', 'PO-5002', 'MATCH', 'Ítems, cantidades y total idénticos (factura escaneada a PNG).'],
   ['INV-1003', 'PO-5003', 'DISCREPANCY', 'Recargo de combustible de 420.00 no autorizado en el PO (4,620.00 vs 4,200.00).'],
-  ['INV-1004', 'PO-5004', 'DISCREPANCY', 'Falta el ítem "Cordless drill 18V" pero se factura el total completo de 2,980.00.'],
+  ['INV-1004', 'PO-5004', 'DISCREPANCY', 'Falta el ítem "Cordless drill 18V" (820.00) pero se factura el total completo de 2,920.00; los ítems detallados suman 2,100.00.'],
   ['INV-1005', '—', 'UNCERTAIN', 'No existe orden de compra de respaldo; no hay evidencia para validar.'],
   ['INV-1006', 'PO-5006', 'DISCREPANCY', 'Precio unitario de "Archive box" inflado 12.00 → 13.50 (915.00 vs 840.00).']
 ] as const
 
+/**
+ * Verifica que el total impreso de cada documento coincida con la suma de sus
+ * ítems. La única excepción es el documento marcado con
+ * `intentionalTotalMismatch`, que es la discrepancia plantada a propósito.
+ *
+ * Existe porque ya pasó: dos totales quedaron mal tipeados y el pipeline los
+ * reportó como discrepancias reales. Los datos de prueba tienen que ser
+ * confiables, o dejan de servir como referencia.
+ */
+function assertArithmetic(doc: Doc): void {
+  const itemsSum = doc.items.reduce((sum, item) => sum + item.quantity * item.unitPrice, 0)
+  const differs = Math.abs(itemsSum - doc.printedTotal) > 0.005
+
+  if (differs && doc.intentionalTotalMismatch !== true) {
+    throw new Error(
+      `${doc.number}: los ítems suman ${itemsSum.toFixed(2)} pero el total impreso es ${doc.printedTotal.toFixed(2)}. ` +
+        'Corregí el total, o marcá el documento con intentionalTotalMismatch si la diferencia es deliberada.'
+    )
+  }
+
+  if (!differs && doc.intentionalTotalMismatch === true) {
+    throw new Error(
+      `${doc.number}: está marcado como discrepancia deliberada pero su aritmética cierra.`
+    )
+  }
+}
+
 async function main() {
+  for (const doc of [PO_5001, PO_5002, PO_5003, PO_5004, PO_5006, INV_1001, INV_1002, INV_1003, INV_1004, INV_1005, INV_1006]) {
+    assertArithmetic(doc)
+  }
+
   await rm(INVOICES_DIR, { recursive: true, force: true })
   await rm(SUPPORT_DIR, { recursive: true, force: true })
   await mkdir(INVOICES_DIR, { recursive: true })

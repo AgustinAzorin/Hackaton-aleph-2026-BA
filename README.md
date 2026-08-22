@@ -47,7 +47,7 @@ npm run cli -- --json
 Chequeos rápidos, sin necesidad de descargar los modelos:
 
 ```bash
-npm run verify     # 28 pruebas: rasterización, OCR, RAG, schemas y verificación determinista
+npm run verify     # 30 pruebas: rasterización, OCR, RAG, schemas y verificación determinista
 npm run typecheck
 ```
 
@@ -106,7 +106,11 @@ Así que el reparto quedó así:
 
 Las correcciones van siempre en dirección conservadora: una coincidencia puede degradarse a discrepancia o a incertidumbre, nunca al revés.
 
-El punto 3 es lo que hace detectable el caso más difícil (INV-1004): ahí los totales **coinciden** —se factura el monto completo por una entrega parcial— y la factura se delata sola, porque sus propios ítems suman 2.100 contra un total de 2.980.
+El punto 3 es lo que hace detectable el caso más difícil (INV-1004): ahí los totales **coinciden** —se factura el monto completo por una entrega parcial— y la factura se delata sola, porque sus propios ítems suman 2.100 contra un total de 2.920.
+
+Ese mismo chequeo tiene una salvaguarda, porque compara dos números que salen del mismo OCR: si el importe de algún renglón no cierra con su cantidad por su precio unitario, el que no es confiable es el OCR y no la factura, así que no se acusa a nadie. En una corrida real, un importe mal leído había producido un desvío inexistente de 1.500.
+
+Y en la corrida en que se agregó, este chequeo encontró **dos totales mal tipeados en los propios datos de prueba**. El generador ahora verifica su aritmética antes de escribir nada.
 
 ### Manejo de incertidumbre
 
@@ -156,7 +160,7 @@ Toda la inferencia vive en un solo archivo, [`src/services/qvacService.ts`](src/
 | INV-1001 | PDF | coincidencia exacta |
 | INV-1002 | PNG | coincidencia exacta (factura escaneada) |
 | INV-1003 | PDF | recargo de combustible de 420,00 no autorizado en el PO |
-| INV-1004 | PNG | falta un ítem del PO pero se factura el total completo |
+| INV-1004 | PNG | falta un ítem del PO (820,00) pero se factura el total completo de 2.920,00 |
 | INV-1005 | PDF | sin orden de compra de respaldo → debe dar `UNCERTAIN` |
 | INV-1006 | PDF | precio unitario inflado de 12,00 a 13,50 |
 
