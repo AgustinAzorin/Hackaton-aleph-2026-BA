@@ -12,7 +12,8 @@
   "scripts": {
     "samples": "tsx samples/generate.ts",
     "cli": "tsx src/cli.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify": "tsx src/selftest.ts"
   },
   "dependencies": {
     "@qvac/sdk": "^0.17.1",
