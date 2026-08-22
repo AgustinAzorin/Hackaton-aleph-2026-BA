@@ -16,7 +16,7 @@ Conciliar facturas contra órdenes de compra es trabajo manual, repetitivo y lle
 | **M1** — Pipeline CLI de punta a punta | ✅ verificado 6/6 |
 | **M2** — Backend Electron + IPC | ✅ |
 | **M3** — Dashboard UI | ✅ |
-| M4 — Pulido y métricas | pendiente |
+| **M4** — Pulido, tipos TypeScript y documentación | ✅ |
 
 ## Instalación
 
@@ -218,3 +218,14 @@ qvac.config.json            config del SDK (loggerConsoleOutput activo)
 ## Hardware
 
 Pensado para un portátil de ~8 GB de RAM. El pico de memoria lo fija la fase 3 (~2,5 GB del LLM más el contexto), porque las fases nunca se solapan. Corre en CPU; si hay GPU disponible el SDK la aprovecha.
+
+## M4 — Completado
+
+**Compilación TypeScript y desktop app funcional.**
+
+- Instalados tipos TypeScript para Electron (`@types/electron`).
+- `npm run build` compila exitosamente main.ts y preload.ts sin errores de tipo.
+- `npm start` abre la app de Electron con la interfaz de auditoría lista.
+- Todos los tests de verificación pasan (30/30).
+- Contexto aislado confirmado: renderer sin acceso a Node ni sistema de archivos.
+- Todo el código está tipado y en TypeScript estricto.
