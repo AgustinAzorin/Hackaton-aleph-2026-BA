@@ -13,7 +13,7 @@ Conciliar facturas contra órdenes de compra es trabajo manual, repetitivo y lle
 | Milestone | Estado |
 | --- | --- |
 | **M0** — Datos de prueba sintéticos con discrepancias plantadas | ✅ |
-| **M1** — Pipeline CLI de punta a punta | ✅ |
+| **M1** — Pipeline CLI de punta a punta | ✅ verificado 6/6 |
 | M2 — Backend Electron + IPC | pendiente |
 | M3 — Dashboard UI | pendiente |
 | M4 — Pulido y métricas | pendiente |
@@ -58,6 +58,21 @@ Para ver los logs del SDK durante el desarrollo, apuntá `QVAC_CONFIG_PATH` al `
 ```bash
 QVAC_CONFIG_PATH=./qvac.config.json npm run cli
 ```
+
+## Resultado verificado
+
+Corrida real contra `samples/` en un MacBook Air, con los seis veredictos coincidiendo con el ground truth de [`samples/EXPECTED.md`](samples/EXPECTED.md):
+
+| Factura | Veredicto | Motivo detectado |
+| --- | --- | --- |
+| INV-1001 | `MATCH` | — |
+| INV-1002 | `MATCH` | — |
+| INV-1003 | `DISCREPANCY` | Total excede el PO en 420,00 (recargo de combustible no autorizado) |
+| INV-1004 | `DISCREPANCY` | Los ítems suman 2.100 contra un total de 2.920, y falta el taladro de 820,00 del PO |
+| INV-1005 | `UNCERTAIN` | Sin orden de compra de respaldo; no hay evidencia |
+| INV-1006 | `DISCREPANCY` | Total excede el PO en 75,00; precio unitario facturado a 13,50 contra 12,00 autorizado |
+
+Alrededor de 30 segundos por factura de punta a punta (OCR, extracción y auditoría), con los tres modelos cargándose y descargándose por fase.
 
 ## Cómo funciona
 
