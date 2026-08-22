@@ -47,7 +47,7 @@ npm run cli -- --json
 Chequeos rápidos, sin necesidad de descargar los modelos:
 
 ```bash
-npm run verify     # 24 pruebas de rasterización, OCR, RAG, schemas y guardia aritmético
+npm run verify     # 28 pruebas: rasterización, OCR, RAG, schemas y verificación determinista
 npm run typecheck
 ```
 
@@ -85,17 +85,28 @@ Por eso la búsqueda RAG ocurre en la fase 2 y no dentro de la auditoría: recup
 
 **La ruta principal es OCR → texto plano → LLM de texto.** No depende de que entre un modelo multimodal en memoria; el multimodal queda como mejora opcional, no como requisito.
 
-### El modelo propone, la aritmética dispone
+### El modelo transcribe, el código compara
 
-La primera corrida real contra `samples/` devolvió **5 MATCH y 0 discrepancias**: el auditor no detectó ninguna de las tres diferencias plantadas. La causa era el orden del schema. La gramática GBNF emite las claves en el orden en que están declaradas, y `verdict` estaba primero — el modelo quedaba obligado a comprometerse con un veredicto antes de haber leído un solo número del respaldo.
+Este fue el hallazgo central del proyecto, y costó dos corridas contra datos reales.
 
-El arreglo tiene dos partes:
+La primera corrida devolvió **5 MATCH y 0 discrepancias**: ninguna de las tres diferencias plantadas fue detectada. La causa era el orden del schema — la gramática GBNF emite las claves en el orden declarado, y `verdict` estaba primero, así que el modelo quedaba obligado a comprometerse con un veredicto antes de haber leído un solo número.
 
-1. **Evidencia antes del veredicto.** El schema de auditoría ahora declara `supportDocumentId`, `supportTotalAmount`, `invoiceTotalAmount`, `itemsOnlyOnInvoice`, `itemsOnlyOnSupport` y `discrepancies` *antes* de `verdict`. La gramática obliga al modelo a transcribir los valores de los dos documentos y a enumerar las diferencias antes de poder emitir el juicio.
+Poner la evidencia antes del veredicto arregló dos de los tres casos. Pero la segunda corrida reveló algo peor: la factura sin orden de compra fue marcada `DISCREPANCY` con 90% de confianza, comparada contra una orden de compra **de otro proveedor** que la búsqueda semántica había traído con score 0,69. Una acusación falsa es un fallo más grave que una omisión.
 
-2. **Un guardia aritmético determinista.** Comparar dos números es exacto y gratis; un LLM de 4B puede leer bien ambos totales y aun así declarar que todo coincide. Así que `applyArithmeticGuard()` contrasta el veredicto contra la aritmética y corrige lo que haga falta, siempre en dirección conservadora: un `MATCH` puede degradarse a `DISCREPANCY` o a `UNCERTAIN`, nunca al revés. Si el total de la factura difiere del respaldo, o si algún ítem aparece de un solo lado, el veredicto es `DISCREPANCY` sin importar lo que haya opinado el modelo. Y si el OCR no pudo leer el total del respaldo, no se permite declarar coincidencia.
+El patrón detrás de los dos errores es el mismo: **cada vez que se le pide al modelo que compare, falla; cuando se le pide que transcriba, acierta.** Un LLM de 4B lee bien un OCR ruidoso, y es malo cruzando dos listas y restando dos números — que es justamente lo que el código hace de forma exacta, gratuita y auditable.
 
-El segundo punto es lo que hace demostrable el caso más difícil (INV-1004): ahí los totales **coinciden** —se factura el monto completo por una entrega parcial— y sólo la comparación de listas de ítems delata el faltante.
+Así que el reparto quedó así:
+
+- **El modelo transcribe** el respaldo recuperado: identificador, proveedor, total e ítems, uno por uno. Su prompt le prohíbe explícitamente juzgar y le pide dejar `discrepancies` vacío.
+- **`verifyAgainstEvidence()` compara**, de forma completamente determinista:
+  1. *¿La evidencia es de esta factura?* Se compara el proveedor del respaldo contra el de la factura, y la referencia de PO citada contra el documento recuperado. Si no corresponden, el veredicto es `UNCERTAIN` y **no se reporta ninguna diferencia** — comparar contra el documento equivocado sólo produce acusaciones falsas.
+  2. *Totales*, con tolerancia de un centavo.
+  3. *Coherencia interna*: los ítems de la factura deben sumar su propio total.
+  4. *Cruce de listas de ítems*, con emparejamiento por solapamiento de palabras para que una variación de OCR no invente un faltante; sobre los ítems emparejados se comparan precio unitario y cantidad.
+
+Las correcciones van siempre en dirección conservadora: una coincidencia puede degradarse a discrepancia o a incertidumbre, nunca al revés.
+
+El punto 3 es lo que hace detectable el caso más difícil (INV-1004): ahí los totales **coinciden** —se factura el monto completo por una entrega parcial— y la factura se delata sola, porque sus propios ítems suman 2.100 contra un total de 2.980.
 
 ### Manejo de incertidumbre
 

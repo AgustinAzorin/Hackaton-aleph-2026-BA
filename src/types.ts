@@ -71,14 +71,12 @@ export type DiscrepancyReport = z.infer<typeof DiscrepancyReportSchema>
 export const AuditResultSchema = z.object({
   /** Identificador del respaldo recuperado, p. ej. "PO-5003"; "" si no hay. */
   supportDocumentId: z.string(),
+  /** Proveedor que figura en el respaldo, para poder detectar un cruce erróneo. */
+  supportVendorName: z.string(),
   /** Total leído del documento de respaldo; 0 si no se pudo leer. */
   supportTotalAmount: z.number(),
-  /** Total de la factura, copiado del JSON extraído. */
-  invoiceTotalAmount: z.number(),
-  /** Ítems facturados que no figuran en el respaldo. */
-  itemsOnlyOnInvoice: z.array(z.string()),
-  /** Ítems del respaldo que la factura no incluye. */
-  itemsOnlyOnSupport: z.array(z.string()),
+  /** Ítems transcritos del respaldo. El código los compara, no el modelo. */
+  supportItems: z.array(LineItemSchema),
   discrepancies: z.array(DiscrepancyReportSchema),
   verdict: VerdictSchema,
   /** Confianza del modelo en su propio veredicto, de 0 a 1. */

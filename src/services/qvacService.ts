@@ -42,6 +42,7 @@ import {
   INVOICE_JSON_SCHEMA,
   InvoiceDataSchema,
   type AuditResult,
+  type DiscrepancyReport,
   type InvoiceData,
   type ReconciliationVerdict,
   type StageTiming
@@ -481,138 +482,271 @@ Reglas:
 - El OCR puede traer errores; si un campo es ilegible, usá "" para texto y 0 para números.
 /no_think`
 
-const AUDIT_SYSTEM = `Sos un auditor de cuentas a pagar. Comparás una factura ya extraída contra el documento de respaldo recuperado (típicamente una orden de compra) y devolvés un único objeto JSON.
+const AUDIT_SYSTEM = `Sos un asistente de auditoría de cuentas a pagar. Recibís una factura ya extraída y los fragmentos de texto de los documentos de respaldo recuperados. Tu tarea es TRANSCRIBIR lo que dice el respaldo, no juzgar si coincide.
 
-Completá los campos EN ORDEN. Los primeros son evidencia: transcribilos del texto antes de emitir ningún juicio.
+La comparación la hace después un verificador determinista. Tu único trabajo es leer bien. Completá los campos EN ORDEN:
 
-1. "supportDocumentId": el identificador del respaldo recuperado, por ejemplo "PO-5003". Si ninguno de los fragmentos recuperados corresponde a esta factura, usá "".
-2. "supportTotalAmount": el TOTAL impreso en ese documento de respaldo, como número. Buscalo en el texto y copialo. Si no lo encontrás, usá 0. No lo estimes ni lo deduzcas del total de la factura.
-3. "invoiceTotalAmount": el total de la factura, copiado del JSON que recibís.
-4. "itemsOnlyOnInvoice": descripciones de ítems que aparecen en la factura y NO en el respaldo.
-5. "itemsOnlyOnSupport": descripciones de ítems que aparecen en el respaldo y NO en la factura. Compará la lista de ítems de los dos documentos, uno por uno.
-6. "discrepancies": una entrada por cada diferencia concreta que puedas citar (total distinto, precio unitario distinto, cantidad distinta, ítem faltante o de más).
-7. "verdict", 8. "confidence", 9. "summary": recién ahora, y consistentes con lo que escribiste arriba.
+1. "supportDocumentId": el identificador del respaldo que corresponde a esta factura, por ejemplo "PO-5003.pdf". Si ninguno de los fragmentos recuperados corresponde a esta factura, usá "".
+2. "supportVendorName": el proveedor que figura en ese respaldo, copiado literal. Este campo es crítico: si el respaldo es de otro proveedor, es la señal de que la recuperación trajo el documento equivocado. No lo copies de la factura — leelo del respaldo.
+3. "supportTotalAmount": el TOTAL impreso en el respaldo, como número. Buscalo en el texto. Si no lo encontrás, usá 0. Nunca lo deduzcas del total de la factura.
+4. "supportItems": TODOS los ítems que figuran en el respaldo, uno por uno, con su descripción, cantidad, precio unitario e importe. Transcribí la lista completa aunque sea larga: si omitís un ítem, el verificador va a creer que la factura dejó de facturarlo.
+5. "discrepancies": dejalo vacío ([]). Lo completa el verificador.
+6. "verdict", 7. "confidence", 8. "summary": tu impresión general. El verificador puede corregirla.
 
-Veredictos:
-- "MATCH": el respaldo corresponde a esta factura y coinciden proveedor, ítems, cantidades, precios unitarios y total. Sólo si "discrepancies" quedó vacío.
-- "DISCREPANCY": el respaldo corresponde a esta factura pero hay al menos una diferencia concreta.
-- "UNCERTAIN": no hay evidencia suficiente para decidir.
-
-Marcá "UNCERTAIN" —no adivines— cuando no se recuperó respaldo, cuando el recuperado es de otro proveedor u otra orden de compra, o cuando el OCR está demasiado corrupto para comparar montos.
-
-Dos advertencias, que son los errores más caros de esta tarea:
-- Que los totales coincidan NO alcanza para MATCH. Una entrega parcial facturada por el monto completo tiene el mismo total y le falta un ítem. Compará siempre las listas de ítems.
-- Inventar una coincidencia es mucho más grave que admitir incertidumbre. Si no pudiste leer el total del respaldo, no declares MATCH.
-
-"summary" es UNA sola frase que un auditor humano lea en menos de cinco segundos.
+Advertencias:
+- No inventes valores. Si algo no está en el texto del respaldo, usá "" o 0.
+- Los fragmentos recuperados pueden ser de otra factura o de otro proveedor. Si es así, "supportDocumentId" va vacío.
+- "summary" es UNA sola frase.
 /no_think`
 
 /** Tolerancia de comparación de montos: por debajo de un centavo es redondeo. */
 const AMOUNT_EPSILON = 0.01
 
 /**
- * Contrasta el veredicto del modelo contra la aritmética y corrige lo que el
- * modelo haya pasado por alto.
+ * Score de recuperación por debajo del cual el respaldo no se considera
+ * evidencia si además no se pudo confirmar el proveedor. Los cruces correctos
+ * en los datos de prueba puntúan ~0,86-0,89; un cruce contra otro proveedor,
+ * ~0,69.
+ */
+const WEAK_RETRIEVAL_SCORE = 0.75
+
+/** Sufijos societarios que no aportan nada al comparar dos razones sociales. */
+const CORPORATE_SUFFIXES = new Set([
+  'llc',
+  'inc',
+  'co',
+  'corp',
+  'ltd',
+  'limited',
+  'sa',
+  'srl',
+  'gmbh',
+  'bv',
+  'plc',
+  'company'
+])
+
+/** Reduce una razón social a sus palabras distintivas. */
+function vendorTokens(name: string): Set<string> {
+  return new Set(
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9áéíóúñü\s]/gi, ' ')
+      .split(/\s+/)
+      .filter((token) => token.length > 2 && !CORPORATE_SUFFIXES.has(token))
+  )
+}
+
+/**
+ * Dos razones sociales se consideran el mismo proveedor si comparten alguna
+ * palabra distintiva. "Northwind Logistics Inc." y "Northwind Logistics"
+ * coinciden; "Quantum Freight Systems" y "Northwind Logistics" no.
+ */
+function sameVendor(a: string, b: string): boolean {
+  const tokensA = vendorTokens(a)
+  const tokensB = vendorTokens(b)
+  if (tokensA.size === 0 || tokensB.size === 0) return false
+  for (const token of tokensA) if (tokensB.has(token)) return true
+  return false
+}
+
+/** Normaliza la descripción de un ítem para poder compararla. */
+function descriptionTokens(description: string): string[] {
+  return description
+    .toLowerCase()
+    .replace(/[^a-z0-9áéíóúñü\s]/gi, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 1)
+}
+
+/**
+ * Empareja dos descripciones de ítem por solapamiento de palabras.
  *
- * El modelo propone, la aritmética dispone. Un LLM de 4B puede leer bien los
- * dos totales y aun así declarar "todo coincide"; comparar dos números, en
- * cambio, es exacto y gratis. Así que todo lo que sea verificable se verifica
- * en código, y sólo lo que exige criterio queda en manos del modelo.
+ * El OCR y el modelo introducen variaciones menores ("Circular saw blade
+ * 190mm" contra "Circular saw blade, 190 mm"), así que una comparación exacta
+ * produciría faltantes falsos. Se exige que la mitad de las palabras de la
+ * descripción más corta aparezcan en la otra.
+ */
+function sameItem(a: string, b: string): boolean {
+  const tokensA = descriptionTokens(a)
+  const tokensB = descriptionTokens(b)
+  if (tokensA.length === 0 || tokensB.length === 0) return false
+
+  const setB = new Set(tokensB)
+  const shared = tokensA.filter((token) => setB.has(token)).length
+  return shared / Math.min(tokensA.length, tokensB.length) >= 0.5
+}
+
+const money = (value: number) => value.toFixed(2)
+
+/**
+ * Verifica el veredicto del modelo contra la evidencia, de forma determinista.
  *
- * Las correcciones son siempre en la dirección conservadora: una coincidencia
+ * El modelo transcribe; el código compara. Esa división no es arbitraria: en
+ * las corridas contra los datos de prueba, el modelo leyó bien los valores de
+ * ambos documentos y aun así declaró coincidencias que no existían. Transcribir
+ * texto de un OCR es lo que un LLM hace bien; restar dos números y cruzar dos
+ * listas es lo que hace bien el código, y además es exacto y auditable.
+ *
+ * Las correcciones van siempre en dirección conservadora: una coincidencia
  * puede degradarse a discrepancia o a incertidumbre, nunca al revés.
  */
-export function applyArithmeticGuard(invoice: InvoiceData, audit: AuditResult): AuditResult {
-  const discrepancies = [...audit.discrepancies]
-  const notes: string[] = []
+export function verifyAgainstEvidence(
+  invoice: InvoiceData,
+  audit: AuditResult,
+  retrievalScore: number | null = null
+): AuditResult {
+  const uncertain = (summary: string, confidence = 0.4): AuditResult => ({
+    ...audit,
+    verdict: 'UNCERTAIN',
+    confidence: Math.min(audit.confidence, confidence),
+    summary,
+    discrepancies: []
+  })
 
-  // Sin respaldo no hay nada contra qué auditar, diga lo que diga el modelo.
+  // --- ¿La evidencia es siquiera de esta factura? -------------------------
+  // Se verifica antes que nada: reportar una diferencia contra el documento
+  // equivocado es una acusación falsa, peor que no decir nada.
+
   if (audit.supportDocumentId.trim().length === 0) {
-    return {
-      ...audit,
-      verdict: 'UNCERTAIN',
-      confidence: Math.min(audit.confidence, 0.5),
-      summary:
-        audit.verdict === 'UNCERTAIN'
-          ? audit.summary
-          : 'No se identificó un documento de respaldo, así que no hay evidencia para sostener un veredicto.',
-      discrepancies
-    }
+    return uncertain(
+      'No se identificó un documento de respaldo, así que no hay evidencia para sostener un veredicto.'
+    )
   }
 
-  // El total del respaldo es ilegible: no se puede confirmar una coincidencia.
+  const vendorKnown = audit.supportVendorName.trim().length > 0
+  if (vendorKnown && !sameVendor(invoice.vendorName, audit.supportVendorName)) {
+    return uncertain(
+      `El respaldo recuperado (${audit.supportDocumentId}) es de ${audit.supportVendorName}, no de ${invoice.vendorName}; no corresponde a esta factura.`
+    )
+  }
+
+  // Sin proveedor confirmado y con una recuperación floja, no hay nada sólido.
+  if (!vendorKnown && retrievalScore !== null && retrievalScore < WEAK_RETRIEVAL_SCORE) {
+    return uncertain(
+      `No se pudo confirmar que ${audit.supportDocumentId} corresponda a esta factura (similitud ${retrievalScore.toFixed(2)}).`
+    )
+  }
+
+  // Una referencia de PO explícita que no coincide con el respaldo recuperado
+  // significa que se está comparando contra otra orden de compra.
+  const poReference = invoice.poReference.trim()
+  if (
+    poReference.length > 0 &&
+    !audit.supportDocumentId.toLowerCase().includes(poReference.toLowerCase())
+  ) {
+    return uncertain(
+      `La factura referencia ${poReference} pero el respaldo recuperado es ${audit.supportDocumentId}; no se encontró la orden de compra citada.`
+    )
+  }
+
   if (audit.supportTotalAmount <= 0) {
-    return {
-      ...audit,
-      verdict: audit.verdict === 'DISCREPANCY' ? 'DISCREPANCY' : 'UNCERTAIN',
-      confidence: Math.min(audit.confidence, 0.5),
-      summary:
-        audit.verdict === 'DISCREPANCY'
-          ? audit.summary
-          : `No se pudo leer el total de ${audit.supportDocumentId}; no hay forma de confirmar que la factura coincida.`,
-      discrepancies
+    return uncertain(
+      `No se pudo leer el total de ${audit.supportDocumentId}; no hay forma de confirmar que la factura coincida.`
+    )
+  }
+
+  // --- Comparación determinista -------------------------------------------
+
+  const discrepancies: DiscrepancyReport[] = []
+  const headline: string[] = []
+
+  // 1. Totales.
+  const delta = invoice.totalAmount - audit.supportTotalAmount
+  if (Math.abs(delta) > AMOUNT_EPSILON) {
+    discrepancies.push({
+      field: 'total',
+      invoiceValue: `${invoice.currency} ${money(invoice.totalAmount)}`,
+      supportValue: `${invoice.currency} ${money(audit.supportTotalAmount)}`,
+      difference: `La factura ${delta > 0 ? 'excede' : 'queda por debajo'} del respaldo en ${money(Math.abs(delta))} ${invoice.currency}.`
+    })
+    headline.push(`el total difiere en ${money(Math.abs(delta))} ${invoice.currency}`)
+  }
+
+  // 2. Coherencia interna de la factura: los ítems deben sumar el total.
+  //    Una entrega parcial facturada por el monto completo se delata acá sola,
+  //    sin necesidad de mirar el respaldo.
+  if (invoice.items.length > 0) {
+    const itemsSum = invoice.items.reduce((sum, item) => sum + item.amount, 0)
+    const internalDelta = invoice.totalAmount - itemsSum
+    if (Math.abs(internalDelta) > AMOUNT_EPSILON) {
+      discrepancies.push({
+        field: 'coherencia interna',
+        invoiceValue: `total ${money(invoice.totalAmount)}`,
+        supportValue: `ítems suman ${money(itemsSum)}`,
+        difference: `La factura cobra ${money(Math.abs(internalDelta))} ${invoice.currency} ${internalDelta > 0 ? 'más' : 'menos'} de lo que detalla en sus ítems.`
+      })
+      headline.push(`los ítems no suman el total facturado`)
     }
   }
 
-  const delta = invoice.totalAmount - audit.supportTotalAmount
-  const totalsDiffer = Math.abs(delta) > AMOUNT_EPSILON
+  // 3. Cruce de listas de ítems.
+  const unmatchedInvoice = [...invoice.items]
+  const onlyOnSupport: string[] = []
 
-  if (totalsDiffer) {
-    const alreadyReported = discrepancies.some((d) => /total/i.test(d.field))
-    if (!alreadyReported) {
+  for (const supportItem of audit.supportItems) {
+    const index = unmatchedInvoice.findIndex((item) =>
+      sameItem(item.description, supportItem.description)
+    )
+
+    if (index === -1) {
+      onlyOnSupport.push(supportItem.description)
       discrepancies.push({
-        field: 'totalAmount',
-        invoiceValue: invoice.totalAmount.toFixed(2),
-        supportValue: audit.supportTotalAmount.toFixed(2),
-        difference: `La factura excede el respaldo en ${delta.toFixed(2)} ${invoice.currency}.`
+        field: `ítem no facturado: ${supportItem.description}`,
+        invoiceValue: 'ausente',
+        supportValue: `${supportItem.quantity} × ${money(supportItem.unitPrice)}`,
+        difference: 'El respaldo autoriza este ítem pero la factura no lo detalla.'
+      })
+      continue
+    }
+
+    const invoiceItem = unmatchedInvoice[index]!
+    unmatchedInvoice.splice(index, 1)
+
+    if (Math.abs(invoiceItem.unitPrice - supportItem.unitPrice) > AMOUNT_EPSILON) {
+      discrepancies.push({
+        field: `precio unitario: ${invoiceItem.description}`,
+        invoiceValue: money(invoiceItem.unitPrice),
+        supportValue: money(supportItem.unitPrice),
+        difference: `Se factura a ${money(invoiceItem.unitPrice)} un ítem autorizado a ${money(supportItem.unitPrice)}.`
       })
     }
-    notes.push(
-      `el total difiere en ${Math.abs(delta).toFixed(2)} ${invoice.currency} (${invoice.totalAmount.toFixed(2)} vs ${audit.supportTotalAmount.toFixed(2)})`
-    )
+
+    if (Math.abs(invoiceItem.quantity - supportItem.quantity) > AMOUNT_EPSILON) {
+      discrepancies.push({
+        field: `cantidad: ${invoiceItem.description}`,
+        invoiceValue: String(invoiceItem.quantity),
+        supportValue: String(supportItem.quantity),
+        difference: `Se facturan ${invoiceItem.quantity} unidades contra ${supportItem.quantity} autorizadas.`
+      })
+    }
   }
 
-  // Un ítem que aparece de un solo lado es una discrepancia aunque los totales
-  // cierren: es justo el caso de la entrega parcial facturada como completa.
-  for (const item of audit.itemsOnlyOnInvoice) {
+  for (const extra of unmatchedInvoice) {
     discrepancies.push({
-      field: `ítem sólo en la factura: ${item}`,
-      invoiceValue: item,
+      field: `ítem no autorizado: ${extra.description}`,
+      invoiceValue: `${extra.quantity} × ${money(extra.unitPrice)}`,
       supportValue: 'ausente',
-      difference: 'Se factura un ítem que el documento de respaldo no autoriza.'
-    })
-  }
-  for (const item of audit.itemsOnlyOnSupport) {
-    discrepancies.push({
-      field: `ítem sólo en el respaldo: ${item}`,
-      invoiceValue: 'ausente',
-      supportValue: item,
-      difference: 'El respaldo incluye un ítem que la factura no detalla.'
+      difference: 'Se factura un ítem que el respaldo no autoriza.'
     })
   }
 
-  const itemsDiffer = audit.itemsOnlyOnInvoice.length + audit.itemsOnlyOnSupport.length > 0
-  if (itemsDiffer) {
-    notes.push(
-      `${audit.itemsOnlyOnInvoice.length + audit.itemsOnlyOnSupport.length} ítem(s) no se corresponden entre ambos documentos`
-    )
+  const itemIssues = onlyOnSupport.length + unmatchedInvoice.length
+  if (itemIssues > 0) {
+    headline.push(`${itemIssues} ítem(s) no se corresponden`)
   }
 
-  if (!totalsDiffer && !itemsDiffer) {
-    // La aritmética no contradice al modelo: se respeta su veredicto.
-    return { ...audit, discrepancies }
+  if (discrepancies.length === 0) {
+    // La evidencia respalda una coincidencia. Se conserva el resumen del
+    // modelo, que suele redactarlo mejor que una plantilla.
+    return { ...audit, verdict: 'MATCH', discrepancies: [] }
   }
 
-  // La aritmética prueba una diferencia. Si el modelo dijo MATCH, se corrige y
-  // se reescribe el resumen para que el auditor lea el hecho, no la opinión.
-  const overridden = audit.verdict !== 'DISCREPANCY'
   return {
     ...audit,
     verdict: 'DISCREPANCY',
-    confidence: overridden ? 0.99 : Math.max(audit.confidence, 0.9),
-    summary: overridden
-      ? `Contra ${audit.supportDocumentId}: ${notes.join(' y ')}.`
-      : audit.summary,
+    confidence: 0.99,
+    summary: `Contra ${audit.supportDocumentId}: ${headline.join(' y ')}.`,
     discrepancies
   }
 }
@@ -774,10 +908,9 @@ export async function extractAndAudit(
             invoice,
             audit: {
               supportDocumentId: bestLabel ?? '',
+              supportVendorName: '',
               supportTotalAmount: 0,
-              invoiceTotalAmount: invoice.totalAmount,
-              itemsOnlyOnInvoice: [],
-              itemsOnlyOnSupport: [],
+              supportItems: [],
               discrepancies: [],
               verdict: 'UNCERTAIN',
               confidence: 0,
@@ -796,7 +929,7 @@ export async function extractAndAudit(
           file: name,
           status: 'OK',
           invoice,
-          audit: applyArithmeticGuard(invoice, audit.data),
+          audit: verifyAgainstEvidence(invoice, audit.data, best?.score ?? null),
           matchedSupportDoc: bestLabel,
           supportScore: best?.score ?? null,
           error: null,

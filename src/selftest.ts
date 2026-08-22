@@ -14,17 +14,18 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { toImagePages, isSupportedDocument } from './services/rasterize.js'
 import {
-  applyArithmeticGuard,
   blocksToText,
   buildRetrievalQuery,
   listDocuments,
-  supportLabel
+  supportLabel,
+  verifyAgainstEvidence
 } from './services/qvacService.js'
 import {
   AUDIT_JSON_SCHEMA,
   AuditResultSchema,
   INVOICE_JSON_SCHEMA,
-  InvoiceDataSchema
+  InvoiceDataSchema,
+  type LineItem
 } from './types.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -219,127 +220,214 @@ await test('zod rechaza un veredicto fuera del enum', () => {
 })
 
 // ---------------------------------------------------------------------------
-console.log('\nGuardia aritmético (los tres casos que el modelo pasó por alto)')
+console.log('\nVerificación determinista (los seis casos de samples/)')
 
-const baseInvoice = {
+const item = (description: string, quantity: number, unitPrice: number) => ({
+  description,
+  quantity,
+  unitPrice,
+  amount: quantity * unitPrice
+})
+
+/** Factura con ítems que suman su total, salvo que se indique lo contrario. */
+const invoiceOf = (vendorName: string, poReference: string, totalAmount: number, items: LineItem[]) => ({
   invoiceNumber: 'INV-0000',
-  vendorName: 'Proveedor',
+  vendorName,
   date: '2026-07-01',
-  totalAmount: 0,
+  totalAmount,
   currency: 'USD',
-  poReference: 'PO-0000',
-  items: []
-}
+  poReference,
+  items
+})
 
-/** Auditoría "todo bien" como la que devolvió el modelo en la primera corrida. */
-const modelSaysMatch = {
-  supportDocumentId: 'PO-0000',
-  supportTotalAmount: 0,
-  invoiceTotalAmount: 0,
-  itemsOnlyOnInvoice: [] as string[],
-  itemsOnlyOnSupport: [] as string[],
+/** Transcripción del respaldo tal como la devuelve el modelo. */
+const supportOf = (
+  supportDocumentId: string,
+  supportVendorName: string,
+  supportTotalAmount: number,
+  supportItems: LineItem[]
+) => ({
+  supportDocumentId,
+  supportVendorName,
+  supportTotalAmount,
+  supportItems,
   discrepancies: [],
   verdict: 'MATCH' as const,
-  confidence: 0.95,
+  confidence: 0.9,
   summary: 'Todo coincide.'
-}
-
-await test('INV-1003: total inflado corrige un MATCH a DISCREPANCY', () => {
-  const result = applyArithmeticGuard(
-    { ...baseInvoice, totalAmount: 4620 },
-    { ...modelSaysMatch, supportDocumentId: 'PO-5003.pdf', supportTotalAmount: 4200 }
-  )
-  assert.equal(result.verdict, 'DISCREPANCY')
-  assert.ok(
-    result.discrepancies.some((d) => d.field === 'totalAmount'),
-    'no se agregó la discrepancia de total'
-  )
-  assert.ok(result.summary.includes('420.00'), `el resumen no cita la diferencia: ${result.summary}`)
 })
 
-await test('INV-1006: precio unitario inflado corrige un MATCH a DISCREPANCY', () => {
-  const result = applyArithmeticGuard(
-    { ...baseInvoice, totalAmount: 915 },
-    { ...modelSaysMatch, supportDocumentId: 'PO-5006.pdf', supportTotalAmount: 840 }
-  )
-  assert.equal(result.verdict, 'DISCREPANCY')
-})
-
-await test('INV-1004: totales iguales pero falta un ítem, igual es DISCREPANCY', () => {
-  // El caso más difícil: la aritmética de totales cierra y sólo la comparación
-  // de ítems delata la entrega parcial facturada como completa.
-  const result = applyArithmeticGuard(
-    { ...baseInvoice, totalAmount: 2980 },
-    {
-      ...modelSaysMatch,
-      supportDocumentId: 'PO-5004.pdf',
-      supportTotalAmount: 2980,
-      itemsOnlyOnSupport: ['Cordless drill 18V']
-    }
-  )
-  assert.equal(result.verdict, 'DISCREPANCY')
-  assert.ok(
-    result.discrepancies.some((d) => d.field.includes('Cordless drill 18V')),
-    'no se reportó el ítem faltante'
-  )
-})
-
-await test('una coincidencia real se mantiene MATCH', () => {
-  const result = applyArithmeticGuard(
-    { ...baseInvoice, totalAmount: 1840 },
-    { ...modelSaysMatch, supportDocumentId: 'PO-5001.pdf', supportTotalAmount: 1840 }
+await test('INV-1001: coincidencia real se mantiene MATCH', () => {
+  const items = [
+    item('A4 Copy Paper, 80gsm, ream', 40, 6.5),
+    item('Toner Cartridge HP 26X', 8, 145),
+    item('Stapler, heavy duty', 10, 42)
+  ]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 1840, items),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, items),
+    0.876
   )
   assert.equal(result.verdict, 'MATCH')
   assert.deepEqual(result.discrepancies, [])
 })
 
-await test('diferencias de centavo se toleran como redondeo', () => {
-  const result = applyArithmeticGuard(
-    { ...baseInvoice, totalAmount: 1840.004 },
-    { ...modelSaysMatch, supportDocumentId: 'PO-5001.pdf', supportTotalAmount: 1840 }
+await test('INV-1003: recargo no autorizado da DISCREPANCY', () => {
+  const supportItems = [
+    item('Container drayage, port to warehouse', 6, 520),
+    item('Palletizing service', 12, 90)
+  ]
+  const invoiceItems = [...supportItems, item('Fuel surcharge', 1, 420)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 4620, invoiceItems),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 4200, supportItems),
+    0.859
   )
-  assert.equal(result.verdict, 'MATCH')
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(
+    result.discrepancies.some((d) => d.field.includes('Fuel surcharge')),
+    'no señaló el ítem no autorizado'
+  )
+  assert.ok(result.discrepancies.some((d) => d.field === 'total'), 'no señaló el total')
 })
 
-await test('sin respaldo identificado el veredicto cae a UNCERTAIN', () => {
-  const result = applyArithmeticGuard(
-    { ...baseInvoice, totalAmount: 3835 },
-    { ...modelSaysMatch, supportDocumentId: '', supportTotalAmount: 0 }
+await test('INV-1004: totales iguales, pero falta un ítem del respaldo', () => {
+  // El caso que el modelo no detectó dos corridas seguidas. Los totales
+  // coinciden en 2980, así que sólo lo delatan el cruce de ítems y el hecho
+  // de que los ítems facturados no sumen el total.
+  const invoiceItems = [
+    item('Circular saw blade 190mm', 20, 34),
+    item('Safety goggles, polycarbonate', 60, 11),
+    item('Work gloves, leather, pair', 80, 9.5)
+  ]
+  const supportItems = [...invoiceItems, item('Cordless drill 18V', 4, 205)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Cedar Hardware Supply', 'PO-5004', 2980, invoiceItems),
+    supportOf('PO-5004.pdf', 'Cedar Hardware Supply', 2980, supportItems),
+    0.885
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(
+    result.discrepancies.some((d) => d.field.includes('Cordless drill 18V')),
+    'no señaló el ítem no facturado'
+  )
+  assert.ok(
+    result.discrepancies.some((d) => d.field === 'coherencia interna'),
+    'no señaló que los ítems no suman el total'
+  )
+})
+
+await test('INV-1005: respaldo de otro proveedor da UNCERTAIN, no DISCREPANCY', () => {
+  // La regresión más grave de la corrida anterior: se acusó a Quantum Freight
+  // comparándola contra una orden de compra de Northwind.
+  const result = verifyAgainstEvidence(
+    invoiceOf('Quantum Freight Systems', '', 3835, [
+      item('Expedited air freight, 3 pallets', 3, 1150),
+      item('Customs brokerage fee', 1, 385)
+    ]),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 4200, [
+      item('Container drayage, port to warehouse', 6, 520)
+    ]),
+    0.692
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.deepEqual(result.discrepancies, [], 'no debe acusar con evidencia ajena')
+  assert.ok(
+    result.summary.includes('Northwind'),
+    `el resumen debe explicar el cruce erróneo: ${result.summary}`
+  )
+})
+
+await test('INV-1006: precio unitario inflado da DISCREPANCY', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5006', 915, [
+      item('Archive box, corrugated', 50, 13.5),
+      item('Label sheets, 100 per pack', 30, 8)
+    ]),
+    supportOf('PO-5006.pdf', 'Acme Office Supplies LLC', 840, [
+      item('Archive box, corrugated', 50, 12),
+      item('Label sheets, 100 per pack', 30, 8)
+    ]),
+    0.873
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(
+    result.discrepancies.some((d) => d.field.startsWith('precio unitario')),
+    'no señaló el precio unitario'
+  )
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nSalvaguardas de evidencia insuficiente')
+
+await test('sin respaldo identificado el veredicto es UNCERTAIN', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Quantum Freight Systems', '', 3835, []),
+    supportOf('', '', 0, []),
+    null
   )
   assert.equal(result.verdict, 'UNCERTAIN')
 })
 
 await test('un total de respaldo ilegible impide declarar MATCH', () => {
-  // Si el OCR no pudo leer el total del PO, no hay con qué confirmar nada.
-  const result = applyArithmeticGuard(
-    { ...baseInvoice, totalAmount: 1840 },
-    { ...modelSaysMatch, supportDocumentId: 'PO-5001.pdf', supportTotalAmount: 0 }
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 1840, []),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 0, []),
+    0.88
   )
   assert.equal(result.verdict, 'UNCERTAIN')
 })
 
-await test('no pisa una discrepancia que el modelo ya había detectado', () => {
-  const result = applyArithmeticGuard(
-    { ...baseInvoice, totalAmount: 4620 },
-    {
-      ...modelSaysMatch,
-      supportDocumentId: 'PO-5003.pdf',
-      supportTotalAmount: 4200,
-      verdict: 'DISCREPANCY',
-      summary: 'Recargo de combustible no autorizado.',
-      discrepancies: [
-        {
-          field: 'totalAmount',
-          invoiceValue: '4620.00',
-          supportValue: '4200.00',
-          difference: 'Recargo de 420.00 no autorizado.'
-        }
-      ]
-    }
+await test('una referencia de PO que no coincide con el respaldo da UNCERTAIN', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 1840, []),
+    supportOf('PO-5006.pdf', 'Acme Office Supplies LLC', 840, []),
+    0.8
   )
-  assert.equal(result.verdict, 'DISCREPANCY')
-  assert.equal(result.summary, 'Recargo de combustible no autorizado.')
-  assert.equal(result.discrepancies.length, 1, 'duplicó la discrepancia de total')
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.ok(result.summary.includes('PO-5001'))
+})
+
+await test('proveedor sin confirmar y recuperación floja da UNCERTAIN', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Quantum Freight Systems', '', 3835, []),
+    supportOf('PO-5003.pdf', '', 4200, []),
+    0.69
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+})
+
+await test('diferencias de centavo se toleran como redondeo', () => {
+  const items = [item('A4 Copy Paper', 40, 6.5)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 260.004, items),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items),
+    0.88
+  )
+  assert.equal(result.verdict, 'MATCH')
+})
+
+await test('el sufijo societario no impide reconocer al mismo proveedor', () => {
+  const items = [item('Palletizing service', 12, 90)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 1080, items),
+    supportOf('PO-5003.pdf', 'Northwind Logistics', 1080, items),
+    0.86
+  )
+  assert.equal(result.verdict, 'MATCH')
+})
+
+await test('una variación menor de OCR no convierte un ítem en faltante', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Cedar Hardware Supply', 'PO-5004', 680, [
+      item('Circular saw blade 190mm', 20, 34)
+    ]),
+    supportOf('PO-5004.pdf', 'Cedar Hardware Supply', 680, [
+      item('Circular saw blade, 190 mm', 20, 34)
+    ]),
+    0.88
+  )
+  assert.equal(result.verdict, 'MATCH', `descripciones equivalentes se trataron como distintas`)
 })
 
 // ---------------------------------------------------------------------------
@@ -361,10 +449,9 @@ await test('la evidencia precede al veredicto en el JSON Schema', () => {
   const verdictAt = keys.indexOf('verdict')
   for (const evidence of [
     'supportDocumentId',
+    'supportVendorName',
     'supportTotalAmount',
-    'invoiceTotalAmount',
-    'itemsOnlyOnInvoice',
-    'itemsOnlyOnSupport',
+    'supportItems',
     'discrepancies'
   ]) {
     assert.ok(
