@@ -50,7 +50,7 @@ function formatProgress(event: ProgressEvent): string {
   return paint('dim', `[${timestamp}] ${event.stage.padEnd(7)} ${event.message}${counter}`)
 }
 
-function printReport(verdicts: ReconciliationVerdict[]): void {
+function printReport(verdicts: ReconciliationVerdict[], elapsedMs: number): void {
   console.log(`\n${paint('bold', '═'.repeat(78))}`)
   console.log(paint('bold', 'REPORTE DE RECONCILIACIÓN'))
   console.log(paint('bold', '═'.repeat(78)))
@@ -106,14 +106,25 @@ function printReport(verdicts: ReconciliationVerdict[]): void {
     else counts.UNCERTAIN++
   }
 
-  const totalMs = verdicts.reduce((sum, r) => sum + r.totalMs, 0)
+  // El tiempo que importa es el del reloj de pared: incluye la carga y descarga
+  // de los tres modelos, que es trabajo real de la corrida y no le pertenece a
+  // ninguna factura en particular. El promedio por factura sale de ahí, no de
+  // sumar filas: bajo decodificación en paralelo, varias facturas comparten el
+  // mismo tramo de tiempo y sumarlas lo contaría dos veces.
+  const perInvoice = verdicts.length > 0 ? elapsedMs / verdicts.length : 0
   console.log(`\n${paint('bold', '─'.repeat(78))}`)
   console.log(
     `${verdicts.length} facturas · ` +
       `${paint('green', `${counts.MATCH} match`)} · ` +
       `${paint('red', `${counts.DISCREPANCY} discrepancias`)} · ` +
       `${paint('yellow', `${counts.UNCERTAIN} inciertas`)} · ` +
-      `${counts.ERROR} errores · ${(totalMs / 1000).toFixed(1)} s de proceso`
+      `${counts.ERROR} errores`
+  )
+  console.log(
+    paint(
+      'dim',
+      `${(elapsedMs / 1000).toFixed(1)} s de reloj · ${(perInvoice / 1000).toFixed(1)} s por factura`
+    )
   )
   console.log(paint('bold', '─'.repeat(78)))
 }
@@ -142,10 +153,12 @@ async function main(): Promise<void> {
     }
   })
 
+  const elapsedMs = Date.now() - started
+
   if (asJson) {
-    console.log(JSON.stringify({ verdicts, elapsedMs: Date.now() - started }, null, 2))
+    console.log(JSON.stringify({ verdicts, elapsedMs }, null, 2))
   } else {
-    printReport(verdicts)
+    printReport(verdicts, elapsedMs)
   }
 }
 

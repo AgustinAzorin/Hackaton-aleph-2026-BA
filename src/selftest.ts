@@ -31,6 +31,15 @@ import {
 } from './services/normalize.js'
 import { canonicalPo, findCitedPo, resolvePoEvidence } from './services/retrieval.js'
 import {
+  LLM_CTX_PER_SLOT,
+  LLM_GENERATION_PARAMS,
+  LLM_MAX_SLOTS,
+  OCR_MAG_RATIO,
+  OCR_RECOGNIZER_BATCH_SIZE,
+  PDF_RASTER_SCALE,
+  planLlm
+} from './services/tuning.js'
+import {
   AUDIT_JSON_SCHEMA,
   AuditResultSchema,
   INVOICE_JSON_SCHEMA,
@@ -868,6 +877,57 @@ await test('la evidencia precede al veredicto en el JSON Schema', () => {
       `${evidence} debe emitirse antes que verdict, pero sale después`
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nPresupuesto de rendimiento')
+
+await test('el plan del LLM nunca pide menos de un slot ni más del máximo', () => {
+  // `planLlm` mira la RAM libre real, así que el resultado depende de la
+  // máquina. Lo que no puede depender de la máquina son los límites: cero
+  // slots no decodifica nada, y de más se queda sin memoria en plena fase 3.
+  for (const invoices of [0, 1, 3, 7, 50]) {
+    const plan = planLlm(invoices)
+    assert.ok(plan.slots >= 1, `${invoices} facturas dieron ${plan.slots} slots`)
+    assert.ok(plan.slots <= LLM_MAX_SLOTS, `${invoices} facturas dieron ${plan.slots} slots`)
+    assert.equal(plan.ctxSize, plan.slots * LLM_CTX_PER_SLOT)
+  }
+})
+
+await test('no se reservan más slots que facturas hay para procesar', () => {
+  // Un slot vacío es KV cache reservada que nadie usa: con una sola factura
+  // en la carpeta, el plan tiene que ser el de antes de todo esto.
+  assert.equal(planLlm(1).slots, 1)
+  assert.ok(planLlm(2).slots <= 2)
+})
+
+await test('el contexto por slot cubre el prompt más largo del pipeline', () => {
+  // El techo real: system de auditoría + factura en JSON + respaldo recortado
+  // a 6000 caracteres, más lo que el modelo genere. Si este margen se pierde,
+  // la auditoría empieza a truncar evidencia en silencio.
+  const worstCasePromptTokens = 6000 / 3.5 + 1000
+  assert.ok(
+    LLM_CTX_PER_SLOT > worstCasePromptTokens + LLM_GENERATION_PARAMS.predict,
+    `${LLM_CTX_PER_SLOT} tokens por slot no alcanzan para el prompt de auditoría`
+  )
+})
+
+await test('la decodificación es determinista', () => {
+  // Muestrear con temperatura al transcribir montos de un OCR sólo agrega la
+  // chance de desviarse del token correcto — y de fallar la validación zod,
+  // que cuesta un reintento completo. Además, sin esto dos corridas del mismo
+  // lote pueden dar veredictos distintos y ninguna medición es comparable.
+  assert.equal(LLM_GENERATION_PARAMS.temp, 0)
+  assert.equal(LLM_GENERATION_PARAMS.top_k, 1)
+  assert.equal(LLM_GENERATION_PARAMS.reasoning_budget, 0)
+})
+
+await test('el OCR no re-magnifica lo que el rasterizador ya amplió', () => {
+  // La resolución que ve el detector es el producto de los dos factores. A
+  // 2.0x una A4 sale de 1190x1684 px, que es donde el reconocedor trabaja
+  // mejor; multiplicar de nuevo sólo interpola píxeles que el vector no tiene.
+  assert.equal(PDF_RASTER_SCALE * OCR_MAG_RATIO, 2)
+  assert.ok(OCR_RECOGNIZER_BATCH_SIZE > 1, 'el reconocedor debe agrupar recortes')
 })
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 {
-  "loggerLevel": "debug",
+  "loggerLevel": "warn",
   "loggerConsoleOutput": true,
-  "httpDownloadConcurrency": 3,
+  "httpDownloadConcurrency": 6,
   "httpConnectionTimeoutMs": 10000
 }

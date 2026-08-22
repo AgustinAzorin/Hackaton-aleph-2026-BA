@@ -77,7 +77,27 @@ Corrida real contra `samples/` en un MacBook Air, con los seis veredictos coinci
 
 > INV-1007 (duplicado de INV-1001) se agregó después de esa corrida. Su veredicto esperado es `DISCREPANCY` con código `DUPLICATE_INVOICE`, decidido por código puro (mismo número de factura ya visto en el lote), sin pasar por el modelo de auditoría.
 
-Alrededor de 30 segundos por factura de punta a punta (OCR, extracción y auditoría), con los tres modelos cargándose y descargándose por fase.
+### Rendimiento
+
+El costo del pipeline se reparte entre tres cosas medibles, y cada una tiene su perilla en [`src/services/tuning.ts`](src/services/tuning.ts):
+
+| Etapa | De qué depende el costo | Perilla |
+| --- | --- | --- |
+| OCR — detección | Píxeles de la página | `PDF_RASTER_SCALE` × `OCR_MAG_RATIO` |
+| OCR — reconocimiento | Cajas de texto detectadas | `OCR_RECOGNIZER_BATCH_SIZE` |
+| LLM — decodificación | Tokens generados × recorridos de los pesos | `LLM_MAX_SLOTS`, `LLM_GENERATION_PARAMS` |
+
+Las tres decisiones de fondo:
+
+- **El detector no re-magnifica lo ya ampliado.** Las páginas se rasterizan a 2x desde el vector del PDF (1190x1684 px en una A4, ~28 px de alto por glifo). Ampliarlas otro 1,5x antes del detector lo hacía trabajar sobre 4,5 Mpx en vez de 2,0 para leer los mismos caracteres: interpolar un render vectorial no inventa detalle que el vector no tenga.
+- **El reconocedor agrupa recortes.** Una A4 tiene entre 60 y 120 cajas de texto; reconocerlas de a una paga el costo fijo de la pasada cien veces por página.
+- **La fase 3 decodifica varias facturas a la vez.** En un modelo cuantizado la decodificación está limitada por ancho de banda de memoria: emitir un token exige recorrer los 2,5 GB de pesos, se emita para una factura o para cuatro. El bucle secuencial pagaba ese recorrido por token *y* por factura. Ahora la fase 3 son dos lotes —todas las extracciones, después todas las auditorías— con una franja de código puro en el medio que resuelve, sin modelo, los casos que no necesitan auditoría (duplicados dentro del lote, órdenes de compra citadas que no existen). Cada factura conserva su prompt, su gramática y su contexto propio: lo único compartido es el paso de decodificación.
+
+La cantidad de slots se calcula contra la RAM libre real de la máquina (`planLlm`), no se fija a ciegas: quedarse sin memoria en plena fase 3 no degrada la velocidad, tumba la corrida. Con un solo slot el comportamiento es idéntico al secuencial.
+
+La decodificación es **determinista** (`temp: 0`, `top_k: 1`, semilla fija). Muestrear con temperatura al transcribir montos de un OCR sólo agrega la chance de desviarse del token correcto — y de fallar la validación zod, que cuesta un reintento completo. Además hace que dos corridas del mismo lote sean comparables entre sí, que es la condición para poder medir cualquier cambio.
+
+El reporte informa **tiempo de reloj** y el promedio por factura derivado de él. Sumar el tiempo de cada fila contaría dos veces el tramo que las facturas comparten mientras decodifican en paralelo; por eso el total de cada fila es la suma de sus etapas amortizadas, no su reloj propio. El desglose del OCR entre detección y reconocimiento sale por el stream de progreso al terminar la fase 1.
 
 ## Cómo funciona
 
@@ -94,8 +114,9 @@ El pipeline corre en **tres fases secuenciales, con un solo modelo grande vivo p
               └────────────────────────────── unloadModel ──────────┘
                                     │
               ┌─ Fase 3: QWEN3_4B_INST_Q4_K_M (~2,5 GB) ───────────┐
-              │  extracción a JSON validado con zod                 │
-              │  auditoría contra la evidencia recuperada           │
+              │  lote 1: extracción a JSON validado con zod         │
+              │  código puro: duplicados y POs inexistentes         │
+              │  lote 2: auditoría contra la evidencia recuperada   │
               └────────────────────────────── unloadModel ──────────┘
                                     │
                         MATCH · DISCREPANCY · UNCERTAIN

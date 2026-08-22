@@ -16,11 +16,21 @@
  * Por eso la recuperación RAG ocurre en la fase 2 y no dentro de la auditoría:
  * buscar durante la fase 3 exigiría tener el modelo de embeddings y el LLM
  * cargados simultáneamente, que es justo lo que el presupuesto prohíbe.
+ *
+ * ## Presupuesto de tiempo
+ *
+ * Dentro de cada fase el trabajo se agrupa por la misma razón que se agrupa
+ * entre fases: el costo dominante es cargar los pesos, no aplicarlos. La fase 1
+ * agrupa recortes de texto en el reconocedor; la fase 3 decodifica varias
+ * facturas por paso en vez de una por vez. Las perillas que gobiernan ese
+ * agrupamiento viven en `tuning.ts`, separadas de la lógica de negocio porque
+ * ninguna de ellas puede cambiar un veredicto: lo que se optimiza es el camino.
  */
 import {
   loadModel,
   unloadModel,
   ocr,
+  batchCompletion,
   completion,
   ragIngest,
   ragSearch,
@@ -50,6 +60,13 @@ import {
   type VerifiedAudit
 } from '../types.js'
 import { missingCriticalFields, normalizeEvidence, normalizeInvoice } from './normalize.js'
+import {
+  LLM_GENERATION_PARAMS,
+  OCR_MAG_RATIO,
+  OCR_RECOGNIZER_BATCH_SIZE,
+  ocrThreads,
+  planLlm
+} from './tuning.js'
 import { isSupportedDocument, toImagePages } from './rasterize.js'
 import { resolvePoEvidence } from './retrieval.js'
 
@@ -175,21 +192,42 @@ export function blocksToText(blocks: OCRTextBlock[]): string {
     .join('\n')
 }
 
+/** Reparto del tiempo de OCR entre detección de cajas y reconocimiento. */
+export interface OcrBreakdown {
+  detectMs: number
+  recognizeMs: number
+}
+
 /**
  * Rasteriza (si hace falta) y transcribe un documento completo a texto plano.
  * Esta es la ruta principal exigida por el track: OCR → texto → LLM de texto,
  * sin depender de que entre en memoria un modelo multimodal.
+ *
+ * Devuelve además el reparto de tiempo que informa el motor. No es decorativo:
+ * la detección escala con los píxeles de la página y el reconocimiento con la
+ * cantidad de cajas, así que son dos perillas distintas (`OCR_MAG_RATIO` y
+ * `OCR_RECOGNIZER_BATCH_SIZE`). Sin este desglose, ajustar el OCR es adivinar.
  */
-async function ocrDocument(modelId: string, filePath: string): Promise<string> {
+async function ocrDocument(
+  modelId: string,
+  filePath: string
+): Promise<{ text: string; breakdown: OcrBreakdown }> {
   const pages = await toImagePages(filePath)
   const texts: string[] = []
+  const breakdown: OcrBreakdown = { detectMs: 0, recognizeMs: 0 }
 
   for (const page of pages) {
-    const { blocks } = ocr({ modelId, image: page, options: { paragraph: false } })
+    const { blocks, stats } = ocr({ modelId, image: page, options: { paragraph: false } })
     texts.push(blocksToText(await blocks))
+
+    // Las estadísticas son best-effort: si el motor no las informa, el
+    // desglose queda en cero y el total por documento sigue siendo válido.
+    const pageStats = await stats.catch(() => undefined)
+    breakdown.detectMs += pageStats?.detectionTime ?? 0
+    breakdown.recognizeMs += pageStats?.recognitionTime ?? 0
   }
 
-  return texts.join('\n\n').trim()
+  return { text: texts.join('\n\n').trim(), breakdown }
 }
 
 /** Lista los documentos soportados de una carpeta, en orden estable. */
@@ -220,6 +258,8 @@ export interface OcrDocumentResult {
   text: string
   error: string | null
   ms: number
+  /** Reparto interno del OCR; en cero si el motor no informó estadísticas. */
+  breakdown: OcrBreakdown
 }
 
 /**
@@ -241,10 +281,16 @@ export async function ocrDocuments(
         modelSrc: OCR_LATIN,
         modelConfig: {
           langList: ['en'],
-          magRatio: 1.5,
+          // La resolución efectiva del detector es PDF_RASTER_SCALE * magRatio.
+          // Ver `tuning.ts`: a 1.0 el detector lee los píxeles que produjo el
+          // rasterizador, sin una interpolación intermedia que no agrega detalle.
+          magRatio: OCR_MAG_RATIO,
+          // El reintento con contraste sólo se dispara en las cajas que quedaron
+          // por debajo del umbral, así que se conserva: es precisión barata.
           contrastRetry: true,
           lowConfidenceThreshold: 0.5,
-          recognizerBatchSize: 1
+          recognizerBatchSize: OCR_RECOGNIZER_BATCH_SIZE,
+          nThreads: ocrThreads()
         },
         onProgress: onDownload
       }),
@@ -263,25 +309,39 @@ export async function ocrDocuments(
 
         const started = now()
         try {
-          const text = await ocrDocument(modelId, file)
+          const { text, breakdown } = await ocrDocument(modelId, file)
           if (text.length === 0) {
             results.push({
               file,
               text: '',
               error: 'El OCR no devolvió texto legible.',
-              ms: now() - started
+              ms: now() - started,
+              breakdown
             })
           } else {
-            results.push({ file, text, error: null, ms: now() - started })
+            results.push({ file, text, error: null, ms: now() - started, breakdown })
           }
         } catch (error) {
           results.push({
             file,
             text: '',
             error: error instanceof Error ? error.message : String(error),
-            ms: now() - started
+            ms: now() - started,
+            breakdown: { detectMs: 0, recognizeMs: 0 }
           })
         }
+      }
+
+      // El desglose agregado del lote: dónde se fue realmente el tiempo de OCR.
+      // Es la medición que dice si conviene tocar la resolución del detector o
+      // el tamaño de lote del reconocedor.
+      const detect = results.reduce((sum, r) => sum + r.breakdown.detectMs, 0)
+      const recognize = results.reduce((sum, r) => sum + r.breakdown.recognizeMs, 0)
+      if (detect + recognize > 0) {
+        onProgress({
+          stage: 'ocr',
+          message: `OCR completo — detección ${(detect / 1000).toFixed(1)} s · reconocimiento ${(recognize / 1000).toFixed(1)} s`
+        })
       }
 
       return results
@@ -403,76 +463,250 @@ interface Message {
 
 type JsonResult<T> = { ok: true; data: T } | { ok: false; error: string }
 
-/**
- * Pide al modelo un JSON que valide contra un schema, con un reintento.
- *
- * La gramática GBNF derivada del JSON Schema ya restringe la generación, pero
- * eso garantiza la forma, no la coherencia semántica; zod es la segunda barrera.
- * Si la validación falla, se reintenta una vez devolviéndole al modelo el error
- * concreto. Si vuelve a fallar, se informa el error hacia arriba en vez de
- * lanzar: el documento termina marcado para revisión humana, nunca en un crash.
- */
-async function completeJson<T>(
-  modelId: string,
-  history: Message[],
-  jsonSchema: Record<string, unknown>,
-  schemaName: string,
-  validator: z.ZodType<T>
-): Promise<JsonResult<T>> {
-  let messages = history
-  let lastError = 'desconocido'
+/** Un pedido de JSON estructurado, identificado para poder casarlo con su factura. */
+interface JsonRequest {
+  key: string
+  history: Message[]
+}
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    let raw = ''
+/** Formato de respuesta compartido por todas las llamadas al LLM. */
+function jsonResponseFormat(schemaName: string, jsonSchema: Record<string, unknown>) {
+  return {
+    type: 'json_schema' as const,
+    json_schema: { name: schemaName, schema: jsonSchema }
+  }
+}
+
+/** Salida cruda de una llamada: el texto del modelo, o el motivo del fallo. */
+type RawOutcome = { ok: true; raw: string } | { ok: false; error: string }
+
+/** Ruta secuencial: una llamada por pedido. Es también el respaldo del lote. */
+async function runSequential(
+  modelId: string,
+  requests: JsonRequest[],
+  schemaName: string,
+  jsonSchema: Record<string, unknown>
+): Promise<Map<string, RawOutcome>> {
+  const outcomes = new Map<string, RawOutcome>()
+
+  for (const request of requests) {
     try {
       const run = completion({
         modelId,
-        history: messages,
+        history: request.history,
         stream: false,
-        responseFormat: {
-          type: 'json_schema',
-          json_schema: { name: schemaName, schema: jsonSchema }
-        }
+        generationParams: { ...LLM_GENERATION_PARAMS },
+        responseFormat: jsonResponseFormat(schemaName, jsonSchema)
       })
-      raw = (await run.final).contentText.trim()
+      outcomes.set(request.key, { ok: true, raw: (await run.final).contentText.trim() })
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error)
-      break // Un fallo de inferencia no se arregla reintentando el mismo prompt.
+      outcomes.set(request.key, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      })
     }
-
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(raw)
-    } catch {
-      lastError = `La salida no es JSON parseable: ${raw.slice(0, 200)}`
-      messages = [
-        ...history,
-        { role: 'assistant', content: raw },
-        {
-          role: 'user',
-          content: `Tu respuesta anterior no era JSON válido. Respondé únicamente con un objeto JSON que cumpla el schema. Error: ${lastError}`
-        }
-      ]
-      continue
-    }
-
-    const result = validator.safeParse(parsed)
-    if (result.success) return { ok: true, data: result.data }
-
-    lastError = result.error.issues
-      .map((issue) => `${issue.path.join('.') || '(raíz)'}: ${issue.message}`)
-      .join('; ')
-    messages = [
-      ...history,
-      { role: 'assistant', content: raw },
-      {
-        role: 'user',
-        content: `Tu respuesta anterior no cumple el schema. Corregí exactamente estos problemas y respondé sólo con el JSON corregido: ${lastError}`
-      }
-    ]
   }
 
-  return { ok: false, error: lastError }
+  return outcomes
+}
+
+/**
+ * Ruta en lote: varias facturas decodificándose a la vez sobre el mismo modelo.
+ *
+ * Devuelve `null` —y no un error— cuando el motor rechaza el lote entero (un
+ * backend sin soporte de slots paralelos, por ejemplo). Ese `null` es la señal
+ * para que el llamador caiga a `runSequential`: perder velocidad es aceptable,
+ * perder la corrida no.
+ */
+async function runBatch(
+  modelId: string,
+  requests: JsonRequest[],
+  schemaName: string,
+  jsonSchema: Record<string, unknown>
+): Promise<Map<string, RawOutcome> | null> {
+  // Los ids del lote son sintéticos: la clave real es una ruta de archivo y no
+  // hay por qué hacerla viajar hasta el motor.
+  const byId = new Map(requests.map((request, index) => [`p${index}`, request.key]))
+
+  const run = batchCompletion({
+    modelId,
+    stream: false,
+    prompts: requests.map((request, index) => ({
+      id: `p${index}`,
+      history: request.history,
+      generationParams: { ...LLM_GENERATION_PARAMS },
+      responseFormat: jsonResponseFormat(schemaName, jsonSchema)
+    }))
+  })
+
+  try {
+    await run.ids
+  } catch {
+    // El lote no llegó siquiera a arrancar: no es un fallo de esta factura,
+    // es que esta máquina no puede decodificar en paralelo.
+    return null
+  }
+
+  const outcomes = new Map<string, RawOutcome>()
+  for (const [id, key] of byId) {
+    try {
+      outcomes.set(key, { ok: true, raw: (await run.byId(id).final).contentText.trim() })
+    } catch (error) {
+      // Un fallo individual sí es de esta factura: se registra y el resto del
+      // lote sigue su curso.
+      outcomes.set(key, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }
+
+  return outcomes
+}
+
+/**
+ * Pide JSON validado contra un schema para un conjunto de facturas a la vez.
+ *
+ * ## Por qué en lote
+ *
+ * Decodificar un modelo cuantizado está limitado por ancho de banda de memoria:
+ * para emitir UN token hay que recorrer los 2,5 GB de pesos igual. Con las
+ * facturas resolviéndose de a una, ese recorrido se pagaba entero por cada
+ * token de cada factura. Decodificando N secuencias en paralelo se recorren los
+ * mismos pesos una sola vez y salen N tokens, así que el costo por factura cae
+ * casi en proporción a la cantidad de slots.
+ *
+ * Nada de esto cambia lo que el modelo responde: cada factura conserva su
+ * prompt, su gramática y su contexto propio; lo único compartido es el paso de
+ * decodificación. Con `slots = 1` el comportamiento es idéntico al secuencial.
+ *
+ * ## Validación y reintento
+ *
+ * La gramática GBNF derivada del JSON Schema restringe la generación, pero eso
+ * garantiza la forma, no la coherencia semántica; zod es la segunda barrera. Lo
+ * que no valida se reintenta UNA vez, devolviéndole al modelo el error concreto
+ * — y los reintentos también viajan en lote, así que un lote con dos facturas
+ * torcidas no degrada a dos llamadas secuenciales. Si vuelve a fallar, se
+ * informa el error hacia arriba en vez de lanzar: el documento termina marcado
+ * para revisión humana, nunca en un crash.
+ */
+async function completeJsonBatch<T>(
+  modelId: string,
+  requests: JsonRequest[],
+  jsonSchema: Record<string, unknown>,
+  schemaName: string,
+  validator: z.ZodType<T>,
+  slots: number,
+  onChunkDone: (done: number, total: number) => void = () => {}
+): Promise<Map<string, JsonResult<T>>> {
+  const results = new Map<string, JsonResult<T>>()
+  const lastErrors = new Map<string, string>()
+  const originals = new Map(requests.map((request) => [request.key, request.history]))
+
+  let pending = requests
+  const total = requests.length
+  let done = 0
+
+  for (let attempt = 1; attempt <= 2 && pending.length > 0; attempt++) {
+    const retry: JsonRequest[] = []
+
+    // El lote se parte en grupos del tamaño del número de slots: así cada
+    // factura tiene garantizada su ventana de contexto completa, en vez de
+    // competir por una ventana compartida.
+    for (let start = 0; start < pending.length; start += slots) {
+      const chunk = pending.slice(start, start + slots)
+
+      // Un chunk de uno no gana nada con la maquinaria del lote y sí paga su
+      // sobrecarga, así que va por la ruta simple.
+      let outcomes =
+        chunk.length === 1
+          ? await runSequential(modelId, chunk, schemaName, jsonSchema)
+          : ((await runBatch(modelId, chunk, schemaName, jsonSchema)) ??
+            (await runSequential(modelId, chunk, schemaName, jsonSchema)))
+
+      // Si el lote entero falló por inferencia —y no porque cada factura sea
+      // mala— se reintenta una vez de a una. El caso que esto cubre es el
+      // desborde de contexto: el `ctx_size` del proceso se reparte entre los
+      // slots, así que un prompt que no entra en su porción sí entra cuando
+      // tiene la ventana entera para él. Perder velocidad es aceptable; perder
+      // el lote completo por una factura larga, no.
+      if (chunk.length > 1 && [...outcomes.values()].every((outcome) => !outcome.ok)) {
+        outcomes = await runSequential(modelId, chunk, schemaName, jsonSchema)
+      }
+
+      for (const request of chunk) {
+        const outcome = outcomes.get(request.key) ?? {
+          ok: false as const,
+          error: 'El motor no devolvió respuesta para este documento.'
+        }
+
+        if (!outcome.ok) {
+          // Un fallo de inferencia no se arregla reintentando el mismo prompt.
+          lastErrors.set(request.key, outcome.error)
+          results.set(request.key, { ok: false, error: outcome.error })
+          continue
+        }
+
+        const raw = outcome.raw
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(raw)
+        } catch {
+          const error = `La salida no es JSON parseable: ${raw.slice(0, 200)}`
+          lastErrors.set(request.key, error)
+          retry.push({
+            key: request.key,
+            history: [
+              ...(originals.get(request.key) ?? request.history),
+              { role: 'assistant', content: raw },
+              {
+                role: 'user',
+                content: `Tu respuesta anterior no era JSON válido. Respondé únicamente con un objeto JSON que cumpla el schema. Error: ${error}`
+              }
+            ]
+          })
+          continue
+        }
+
+        const validation = validator.safeParse(parsed)
+        if (validation.success) {
+          results.set(request.key, { ok: true, data: validation.data })
+          continue
+        }
+
+        const error = validation.error.issues
+          .map((issue) => `${issue.path.join('.') || '(raíz)'}: ${issue.message}`)
+          .join('; ')
+        lastErrors.set(request.key, error)
+        retry.push({
+          key: request.key,
+          history: [
+            ...(originals.get(request.key) ?? request.history),
+            { role: 'assistant', content: raw },
+            {
+              role: 'user',
+              content: `Tu respuesta anterior no cumple el schema. Corregí exactamente estos problemas y respondé sólo con el JSON corregido: ${error}`
+            }
+          ]
+        })
+      }
+
+      done += chunk.length
+      onChunkDone(Math.min(done, total), total)
+    }
+
+    pending = retry
+  }
+
+  // Lo que siguió fallando después del reintento se informa con su último error.
+  for (const request of pending) {
+    results.set(request.key, {
+      ok: false,
+      error: lastErrors.get(request.key) ?? 'desconocido'
+    })
+  }
+
+  return results
 }
 
 const EXTRACTION_SYSTEM = `Sos un extractor de datos de facturas. Recibís el texto crudo de una factura obtenido por OCR y devolvés únicamente un objeto JSON.
@@ -928,10 +1162,96 @@ export interface AuditInput {
 }
 
 /**
+ * Prompt de extracción de una factura. Se arma aparte del bucle porque las
+ * dos fases del lote necesitan construirlo en momentos distintos.
+ */
+function extractionRequest(input: AuditInput): JsonRequest {
+  return {
+    key: input.ocr.file,
+    history: [
+      { role: 'system', content: EXTRACTION_SYSTEM },
+      { role: 'user', content: `Texto OCR de la factura:\n\n${clip(input.ocr.text, 6000)}` }
+    ]
+  }
+}
+
+/** Prompt de auditoría de una factura ya extraída, con su evidencia al lado. */
+function auditRequest(file: string, invoice: InvoiceData, supportContext: string): JsonRequest {
+  return {
+    key: file,
+    history: [
+      { role: 'system', content: AUDIT_SYSTEM },
+      {
+        role: 'user',
+        content: [
+          'FACTURA EXTRAÍDA (JSON):',
+          JSON.stringify(invoice, null, 2),
+          '',
+          'DOCUMENTOS DE RESPALDO RECUPERADOS:',
+          clip(supportContext, 6000),
+          '',
+          'Emití tu veredicto en JSON.'
+        ].join('\n')
+      }
+    ]
+  }
+}
+
+/**
+ * Lo que queda pendiente de una factura después de extraerla: o ya tiene
+ * veredicto cerrado (error, duplicado, PO inexistente) o le falta la auditoría.
+ */
+interface PendingAudit {
+  input: AuditInput
+  invoice: InvoiceData
+  bestLabel: string | null
+  supportScore: number | null
+  supportContext: string
+}
+
+/**
+ * Reparte el tiempo de un lote entre las facturas que lo compusieron.
+ *
+ * Bajo decodificación en paralelo no existe "el tiempo de esta factura": las N
+ * secuencias avanzan en el mismo paso. La cifra honesta es el costo amortizado,
+ * que además es la que hay que mirar para decidir si el lote conviene.
+ */
+function amortized(totalMs: number, count: number): number {
+  return count === 0 ? 0 : Math.round(totalMs / count)
+}
+
+/**
+ * Costo total imputable a una factura: la suma de sus etapas.
+ *
+ * No es el reloj de pared desde que empezó su fila — bajo decodificación en
+ * paralelo ese reloj corre igual para todas y sumarlo entre facturas contaría
+ * el mismo tiempo N veces. Sumando etapas amortizadas, el total del reporte
+ * vuelve a aproximar el tiempo real de la corrida.
+ */
+function totalOf(timings: StageTiming[]): number {
+  return timings.reduce((sum, timing) => sum + timing.ms, 0)
+}
+
+/**
  * Extrae y audita todas las facturas con un único LLM cargado.
  *
- * Cada factura se resuelve de forma independiente: un fallo de extracción o de
- * auditoría degrada esa fila a `ERROR` o `UNCERTAIN` y el lote continúa.
+ * ## Por qué en dos lotes y no en un bucle
+ *
+ * Las facturas son independientes entre sí: la extracción de una no necesita el
+ * resultado de otra, y su auditoría sólo depende de su propia extracción. El
+ * bucle secuencial anterior pagaba, por cada factura y por cada token, el
+ * recorrido completo de los 2,5 GB de pesos del modelo. Agrupando las llamadas
+ * en dos lotes —todas las extracciones, después todas las auditorías— ese
+ * recorrido se comparte entre las facturas que decodifican a la vez.
+ *
+ * Entre los dos lotes queda una franja de código puro, sin modelo trabajando,
+ * donde se resuelven los casos que NO necesitan auditoría: duplicados dentro
+ * del lote y órdenes de compra citadas que no existen. Esas facturas nunca
+ * llegan al segundo lote, así que el trabajo del modelo baja además en volumen.
+ *
+ * El orden de salida es siempre el de entrada, y cada factura se resuelve de
+ * forma independiente: un fallo de extracción o de auditoría degrada esa fila a
+ * `ERROR` o `UNCERTAIN` y el resto del lote continúa.
  */
 export async function extractAndAudit(
   inputs: AuditInput[],
@@ -939,77 +1259,96 @@ export async function extractAndAudit(
 ): Promise<ReconciliationVerdict[]> {
   if (inputs.length === 0) return []
 
+  // Cuántas facturas puede decodificar esta máquina a la vez sin quedarse sin
+  // RAM. Con un solo slot el pipeline se comporta exactamente como antes.
+  const plan = planLlm(inputs.length)
+
   return withModel(
     QWEN3_4B_INST_Q4_K_M.name,
     (onDownload) =>
       loadModel({
         modelSrc: QWEN3_4B_INST_Q4_K_M,
-        modelConfig: { ctx_size: 8192 },
+        modelConfig: {
+          // `ctx_size` es del proceso y se reparte entre los slots, así que se
+          // dimensiona en función de cuántos haya. Ver `tuning.ts`.
+          ctx_size: plan.ctxSize,
+          parallel: plan.slots,
+          // Qwen3 es un modelo híbrido con canal de razonamiento. La gramática
+          // JSON ya lo vuelve inalcanzable, pero apagarlo explícitamente no
+          // depende de que la gramática siga siendo la que es.
+          reasoning_budget: 0
+        },
         onProgress: onDownload
       }),
     onProgress,
     async (modelId) => {
       const verdicts: ReconciliationVerdict[] = []
-      // Número de factura ya visto en este lote → archivo donde apareció.
-      // La detección de duplicados es código puro sobre lo ya extraído.
+
+      // --- Paso 1: extracción, todas las facturas legibles en lote ----------
+      const extractable = inputs.filter(
+        (input) => input.ocr.error === null && input.ocr.text.length > 0
+      )
+
+      onProgress({
+        stage: 'extract',
+        message: `Extrayendo ${extractable.length} facturas (${plan.slots} en paralelo)`,
+        current: 0,
+        total: extractable.length
+      })
+
+      const extractStarted = now()
+      const extractions = await completeJsonBatch(
+        modelId,
+        extractable.map(extractionRequest),
+        INVOICE_JSON_SCHEMA,
+        'invoice_data',
+        InvoiceDataSchema,
+        plan.slots,
+        (current, total) =>
+          onProgress({ stage: 'extract', message: 'Extracción estructurada', current, total })
+      )
+      const extractMs = amortized(now() - extractStarted, extractable.length)
+
+      // --- Paso 2: todo lo que se decide sin modelo -------------------------
+      // Corre en el orden de entrada porque la detección de duplicados depende
+      // de él: se marca la ocurrencia POSTERIOR, no la primera.
+      const pending: PendingAudit[] = []
+      const closed = new Map<string, ReconciliationVerdict>()
       const seenInvoiceNumbers = new Map<string, string>()
 
-      for (const [index, input] of inputs.entries()) {
-        const name = path.basename(input.ocr.file)
-        const startedAll = now()
+      for (const input of inputs) {
+        const file = input.ocr.file
+        const name = path.basename(file)
         const timings: StageTiming[] = [{ stage: 'ocr', ms: input.ocr.ms }]
+
+        const close = (verdict: Omit<ReconciliationVerdict, 'file' | 'timings' | 'totalMs'>) => {
+          closed.set(file, { file: name, ...verdict, timings, totalMs: totalOf(timings) })
+        }
 
         // El OCR ya falló: no hay nada que extraer.
         if (input.ocr.error !== null || input.ocr.text.length === 0) {
-          verdicts.push({
-            file: name,
+          close({
             status: 'ERROR',
             invoice: null,
             audit: null,
             matchedSupportDoc: null,
             supportScore: null,
-            error: input.ocr.error ?? 'El OCR no devolvió texto.',
-            timings,
-            totalMs: now() - startedAll
+            error: input.ocr.error ?? 'El OCR no devolvió texto.'
           })
           continue
         }
 
-        // --- Extracción -----------------------------------------------------
-        onProgress({
-          stage: 'extract',
-          message: `Extrayendo ${name}`,
-          current: index + 1,
-          total: inputs.length
-        })
+        timings.push({ stage: 'extract', ms: extractMs })
 
-        const extractStarted = now()
-        const extraction = await completeJson<InvoiceData>(
-          modelId,
-          [
-            { role: 'system', content: EXTRACTION_SYSTEM },
-            {
-              role: 'user',
-              content: `Texto OCR de la factura:\n\n${clip(input.ocr.text, 6000)}`
-            }
-          ],
-          INVOICE_JSON_SCHEMA,
-          'invoice_data',
-          InvoiceDataSchema
-        )
-        timings.push({ stage: 'extract', ms: now() - extractStarted })
-
-        if (!extraction.ok) {
-          verdicts.push({
-            file: name,
+        const extraction = extractions.get(file)
+        if (extraction === undefined || !extraction.ok) {
+          close({
             status: 'ERROR',
             invoice: null,
             audit: null,
             matchedSupportDoc: null,
             supportScore: null,
-            error: `Falló la extracción estructurada: ${extraction.error}`,
-            timings,
-            totalMs: now() - startedAll
+            error: `Falló la extracción estructurada: ${extraction?.error ?? 'sin respuesta del modelo'}`
           })
           continue
         }
@@ -1023,8 +1362,7 @@ export async function extractAndAudit(
         // al modelo de auditoría.
         const duplicateOf = registerInvoiceNumber(seenInvoiceNumbers, invoice.invoiceNumber, name)
         if (duplicateOf !== null) {
-          verdicts.push({
-            file: name,
+          close({
             status: 'OK',
             invoice,
             audit: {
@@ -1049,9 +1387,7 @@ export async function extractAndAudit(
             },
             matchedSupportDoc: duplicateOf,
             supportScore: null,
-            error: null,
-            timings,
-            totalMs: now() - startedAll
+            error: null
           })
           continue
         }
@@ -1062,8 +1398,7 @@ export async function extractAndAudit(
         // la búsqueda semántica "a ver si hay algo parecido" sólo puede traer
         // un PO ajeno y fabricar acusaciones falsas.
         if (input.evidence.kind === 'po-not-found') {
-          verdicts.push({
-            file: name,
+          close({
             status: 'OK',
             invoice,
             audit: {
@@ -1080,9 +1415,7 @@ export async function extractAndAudit(
             },
             matchedSupportDoc: null,
             supportScore: null,
-            error: null,
-            timings,
-            totalMs: now() - startedAll
+            error: null
           })
           continue
         }
@@ -1113,47 +1446,56 @@ export async function extractAndAudit(
               : 'NO SE RECUPERÓ NINGÚN DOCUMENTO DE RESPALDO.'
         }
 
-        // --- Auditoría ------------------------------------------------------
-        onProgress({
-          stage: 'audit',
-          message: `Auditando ${name}`,
-          current: index + 1,
-          total: inputs.length
-        })
+        pending.push({ input, invoice, bestLabel, supportScore, supportContext })
+      }
 
-        const auditStarted = now()
-        const audit = await completeJson<AuditResult>(
-          modelId,
-          [
-            { role: 'system', content: AUDIT_SYSTEM },
-            {
-              role: 'user',
-              content: [
-                'FACTURA EXTRAÍDA (JSON):',
-                JSON.stringify(invoice, null, 2),
-                '',
-                'DOCUMENTOS DE RESPALDO RECUPERADOS:',
-                clip(supportContext, 6000),
-                '',
-                'Emití tu veredicto en JSON.'
-              ].join('\n')
-            }
-          ],
-          AUDIT_JSON_SCHEMA,
-          'audit_result',
-          AuditResultSchema
-        )
-        timings.push({ stage: 'audit', ms: now() - auditStarted })
+      // --- Paso 3: auditoría, en lote --------------------------------------
+      onProgress({
+        stage: 'audit',
+        message: `Auditando ${pending.length} facturas (${plan.slots} en paralelo)`,
+        current: 0,
+        total: pending.length
+      })
 
-        if (!audit.ok) {
+      const auditStarted = now()
+      const audits = await completeJsonBatch(
+        modelId,
+        pending.map((entry) =>
+          auditRequest(entry.input.ocr.file, entry.invoice, entry.supportContext)
+        ),
+        AUDIT_JSON_SCHEMA,
+        'audit_result',
+        AuditResultSchema,
+        plan.slots,
+        (current, total) =>
+          onProgress({ stage: 'audit', message: 'Auditoría contra respaldo', current, total })
+      )
+      const auditMs = amortized(now() - auditStarted, pending.length)
+
+      // --- Paso 4: verificación determinista y armado del reporte -----------
+      const audited = new Map<string, ReconciliationVerdict>()
+
+      for (const entry of pending) {
+        const file = entry.input.ocr.file
+        const name = path.basename(file)
+        const timings: StageTiming[] = [
+          { stage: 'ocr', ms: entry.input.ocr.ms },
+          { stage: 'extract', ms: extractMs },
+          { stage: 'audit', ms: auditMs }
+        ]
+
+        const audit = audits.get(file)
+
+        if (audit === undefined || !audit.ok) {
           // Falló la auditoría, pero la extracción sirvió: se conserva lo
           // obtenido y se marca UNCERTAIN con el motivo, en vez de perderlo todo.
-          verdicts.push({
+          const error = audit?.error ?? 'sin respuesta del modelo'
+          audited.set(file, {
             file: name,
             status: 'OK',
-            invoice,
+            invoice: entry.invoice,
             audit: {
-              supportDocumentId: bestLabel ?? '',
+              supportDocumentId: entry.bestLabel ?? '',
               supportVendorName: '',
               supportTotalAmount: 0,
               supportCurrency: '',
@@ -1161,35 +1503,43 @@ export async function extractAndAudit(
               discrepancies: [],
               verdict: 'UNCERTAIN',
               confidence: 0,
-              summary: `El modelo de auditoría no produjo un veredicto válido: ${audit.error}`,
+              summary: `El modelo de auditoría no produjo un veredicto válido: ${error}`,
               reasonCode: 'MODEL_OUTPUT_INVALID'
             },
-            matchedSupportDoc: bestLabel,
-            supportScore,
-            error: audit.error,
+            matchedSupportDoc: entry.bestLabel,
+            supportScore: entry.supportScore,
+            error,
             timings,
-            totalMs: now() - startedAll
+            totalMs: totalOf(timings)
           })
           continue
         }
 
-        verdicts.push({
+        audited.set(file, {
           file: name,
           status: 'OK',
-          invoice,
-          audit: verifyAgainstEvidence(invoice, audit.data, supportScore),
-          matchedSupportDoc: bestLabel,
-          supportScore,
+          invoice: entry.invoice,
+          audit: verifyAgainstEvidence(entry.invoice, audit.data, entry.supportScore),
+          matchedSupportDoc: entry.bestLabel,
+          supportScore: entry.supportScore,
           error: null,
           timings,
-          totalMs: now() - startedAll
+          totalMs: totalOf(timings)
         })
+      }
+
+      // El reporte sale en el orden en que llegaron las facturas, sin importar
+      // en qué paso se resolvió cada una.
+      for (const input of inputs) {
+        const verdict = closed.get(input.ocr.file) ?? audited.get(input.ocr.file)
+        if (verdict !== undefined) verdicts.push(verdict)
       }
 
       return verdicts
     }
   )
 }
+
 
 // ---------------------------------------------------------------------------
 // Orquestación
