@@ -430,6 +430,18 @@ tbody tr:last-child td {
   font-family: var(--sans);
 }
 
+.reason-code {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--faint);
+}
+
 .support {
   font-family: var(--mono);
   font-size: 12px;
@@ -498,6 +510,13 @@ tbody tr:last-child td {
 
 .diff-values .sup {
   color: var(--match);
+}
+
+.diff-code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  white-space: nowrap;
 }
 
 .diff-note {

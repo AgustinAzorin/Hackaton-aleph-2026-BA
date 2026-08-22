@@ -50,7 +50,7 @@ npm run cli -- --json
 Chequeos rápidos, sin necesidad de descargar los modelos:
 
 ```bash
-npm run verify     # 30 pruebas: rasterización, OCR, RAG, schemas y verificación determinista
+npm run verify     # 64 pruebas: rasterización, OCR, retrieval híbrido, schemas y verificación determinista
 npm run typecheck
 ```
 
@@ -74,6 +74,8 @@ Corrida real contra `samples/` en un MacBook Air, con los seis veredictos coinci
 | INV-1004 | `DISCREPANCY` | Los ítems suman 2.100 contra un total de 2.920, y falta el taladro de 820,00 del PO |
 | INV-1005 | `UNCERTAIN` | Sin orden de compra de respaldo; no hay evidencia |
 | INV-1006 | `DISCREPANCY` | Total excede el PO en 75,00; precio unitario facturado a 13,50 contra 12,00 autorizado |
+
+> INV-1007 (duplicado de INV-1001) se agregó después de esa corrida. Su veredicto esperado es `DISCREPANCY` con código `DUPLICATE_INVOICE`, decidido por código puro (mismo número de factura ya visto en el lote), sin pasar por el modelo de auditoría.
 
 Alrededor de 30 segundos por factura de punta a punta (OCR, extracción y auditoría), con los tres modelos cargándose y descargándose por fase.
 
@@ -142,6 +144,12 @@ Ese mismo chequeo tiene una salvaguarda, porque compara dos números que salen d
 
 Y en la corrida en que se agregó, este chequeo encontró **dos totales mal tipeados en los propios datos de prueba**. El generador ahora verifica su aritmética antes de escribir nada.
 
+### Códigos de motivo estructurados
+
+Cada discrepancia y cada veredicto no-MATCH llevan un `reasonCode` legible por máquina (`TOTAL_MISMATCH`, `INTERNAL_SUM_MISMATCH`, `UNIT_PRICE_MISMATCH`, `QUANTITY_MISMATCH`, `ITEM_NOT_ON_INVOICE`, `ITEM_NOT_AUTHORIZED`, `CURRENCY_MISMATCH`, `PO_NOT_FOUND`, `VENDOR_MISMATCH`, `NO_EVIDENCE`, `WEAK_RETRIEVAL`, `EVIDENCE_UNREADABLE`, `MISSING_CRITICAL_FIELD`, `DUPLICATE_INVOICE`, `MODEL_OUTPUT_INVALID`). Los emite exclusivamente el verificador determinista, así que "¿por qué el sistema decidió esto?" se responde sin volver a preguntarle al LLM: cada código es trazable a una regla concreta del código. La `confidence` del modelo sigue siendo cosmética — se muestra en el reporte, pero jamás participa de ninguna decisión.
+
+Además, dos monedas distintas entre factura y respaldo hacen los montos incomparables (`CURRENCY_MISMATCH` → `UNCERTAIN`, sin conversión implícita ni acusaciones numéricas), y un mismo número de factura repetido dentro del lote marca la ocurrencia posterior como `DUPLICATE_INVOICE`, referenciando el archivo original — detección 100% en código, sin modelo.
+
 ### Manejo de incertidumbre
 
 El prompt de auditoría instruye explícitamente al modelo a responder `UNCERTAIN` cuando no hay evidencia suficiente: si no se recuperó ningún respaldo, si el recuperado es de otro proveedor u otra orden de compra, o si el OCR quedó demasiado corrupto para comparar montos. Inventar una coincidencia es un error mucho más caro que admitir la duda, y el reporte lo dice así.
@@ -193,7 +201,7 @@ Toda la inferencia vive en un solo archivo, [`src/services/qvacService.ts`](src/
 
 ## Datos de prueba
 
-`npm run samples` genera 6 facturas y 5 órdenes de compra con discrepancias plantadas a propósito, más [`samples/EXPECTED.md`](samples/EXPECTED.md) con el veredicto esperado de cada caso:
+`npm run samples` genera 7 facturas y 5 órdenes de compra con discrepancias plantadas a propósito, más [`samples/EXPECTED.md`](samples/EXPECTED.md) con el veredicto esperado de cada caso:
 
 | Factura | Formato | Caso |
 | --- | --- | --- |
@@ -203,6 +211,7 @@ Toda la inferencia vive en un solo archivo, [`src/services/qvacService.ts`](src/
 | INV-1004 | PNG | falta un ítem del PO (820,00) pero se factura el total completo de 2.920,00 |
 | INV-1005 | PDF | sin orden de compra de respaldo → debe dar `UNCERTAIN` |
 | INV-1006 | PDF | precio unitario inflado de 12,00 a 13,50 |
+| INV-1007 | PDF | reenvío duplicado de INV-1001 (mismo número de factura) → `DUPLICATE_INVOICE` |
 
 Las facturas vienen en PDF y en PNG a propósito, para que cada corrida ejercite tanto la rama de rasterización como la de imagen directa.
 

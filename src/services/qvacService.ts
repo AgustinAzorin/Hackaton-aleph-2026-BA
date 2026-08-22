@@ -44,8 +44,10 @@ import {
   type AuditResult,
   type DiscrepancyReport,
   type InvoiceData,
+  type ReasonCode,
   type ReconciliationVerdict,
-  type StageTiming
+  type StageTiming,
+  type VerifiedAudit
 } from '../types.js'
 import { missingCriticalFields, normalizeEvidence, normalizeInvoice } from './normalize.js'
 import { isSupportedDocument, toImagePages } from './rasterize.js'
@@ -634,19 +636,20 @@ export function verifyAgainstEvidence(
   rawInvoice: InvoiceData,
   rawAudit: AuditResult,
   retrievalScore: number | null = null
-): AuditResult {
+): VerifiedAudit {
   // El verificador consume ÚNICAMENTE datos normalizados: los centinelas de
   // extracción ("" y 0) ya llegaron convertidos en `null` explícito, así que
   // acá "faltante" y "valor real" no pueden confundirse.
   const invoice = normalizeInvoice(rawInvoice)
   const evidence = normalizeEvidence(rawAudit)
 
-  const uncertain = (summary: string, confidence = 0.4): AuditResult => ({
+  const uncertain = (reasonCode: ReasonCode, summary: string, confidence = 0.4): VerifiedAudit => ({
     ...rawAudit,
     verdict: 'UNCERTAIN',
     confidence: Math.min(rawAudit.confidence, confidence),
     summary,
-    discrepancies: []
+    discrepancies: [],
+    reasonCode
   })
 
   // --- ¿La factura es siquiera auditable? ---------------------------------
@@ -660,6 +663,7 @@ export function verifyAgainstEvidence(
     invoice.currency === null
   ) {
     return uncertain(
+      'MISSING_CRITICAL_FIELD',
       `No se pudo leer ${missing.join(', ')} de la factura; sin esos campos no hay comparación posible.`
     )
   }
@@ -670,6 +674,7 @@ export function verifyAgainstEvidence(
 
   if (evidence.supportDocumentId === null) {
     return uncertain(
+      'NO_EVIDENCE',
       'No se identificó un documento de respaldo, así que no hay evidencia para sostener un veredicto.'
     )
   }
@@ -680,6 +685,7 @@ export function verifyAgainstEvidence(
     !sameVendor(invoice.vendorName, evidence.supportVendorName)
   ) {
     return uncertain(
+      'VENDOR_MISMATCH',
       `El respaldo recuperado (${supportDocumentId}) es de ${evidence.supportVendorName}, no de ${invoice.vendorName}; no corresponde a esta factura.`
     )
   }
@@ -691,6 +697,7 @@ export function verifyAgainstEvidence(
     retrievalScore < WEAK_RETRIEVAL_SCORE
   ) {
     return uncertain(
+      'WEAK_RETRIEVAL',
       `No se pudo confirmar que ${supportDocumentId} corresponda a esta factura (similitud ${retrievalScore.toFixed(2)}).`
     )
   }
@@ -702,6 +709,7 @@ export function verifyAgainstEvidence(
     !supportDocumentId.toLowerCase().includes(invoice.poReference.toLowerCase())
   ) {
     return uncertain(
+      'PO_NOT_FOUND',
       `La factura referencia ${invoice.poReference} pero el respaldo recuperado es ${supportDocumentId}; no se encontró la orden de compra citada.`
     )
   }
@@ -717,6 +725,7 @@ export function verifyAgainstEvidence(
 
   if (evidence.supportCurrency !== null && evidence.supportCurrency !== currency) {
     return uncertain(
+      'CURRENCY_MISMATCH',
       `La factura está en ${currency} pero ${supportDocumentId} está en ${evidence.supportCurrency}; los montos no son comparables sin una conversión explícita.`
     )
   }
@@ -729,6 +738,7 @@ export function verifyAgainstEvidence(
 
   if (evidence.supportTotalAmount === null) {
     return uncertain(
+      'EVIDENCE_UNREADABLE',
       `No se pudo leer el total de ${supportDocumentId}; no hay forma de confirmar que la factura coincida.`
     )
   }
@@ -742,6 +752,7 @@ export function verifyAgainstEvidence(
   const delta = invoice.totalAmount - evidence.supportTotalAmount
   if (Math.abs(delta) > AMOUNT_EPSILON) {
     discrepancies.push({
+      reasonCode: 'TOTAL_MISMATCH',
       field: 'total',
       invoiceValue: `${currency} ${money(invoice.totalAmount)}`,
       supportValue: `${currency} ${money(evidence.supportTotalAmount)}`,
@@ -768,6 +779,7 @@ export function verifyAgainstEvidence(
     const internalDelta = invoice.totalAmount - itemsSum
     if (Math.abs(internalDelta) > AMOUNT_EPSILON) {
       discrepancies.push({
+        reasonCode: 'INTERNAL_SUM_MISMATCH',
         field: 'coherencia interna',
         invoiceValue: `total ${money(invoice.totalAmount)}`,
         supportValue: `ítems suman ${money(itemsSum)}`,
@@ -789,6 +801,7 @@ export function verifyAgainstEvidence(
     if (index === -1) {
       onlyOnSupport.push(supportItem.description)
       discrepancies.push({
+        reasonCode: 'ITEM_NOT_ON_INVOICE',
         field: `ítem no facturado: ${supportItem.description}`,
         invoiceValue: 'ausente',
         supportValue: `${currency} ${money(supportItem.amount)}`,
@@ -802,6 +815,7 @@ export function verifyAgainstEvidence(
 
     if (Math.abs(invoiceItem.unitPrice - supportItem.unitPrice) > AMOUNT_EPSILON) {
       discrepancies.push({
+        reasonCode: 'UNIT_PRICE_MISMATCH',
         field: `precio unitario: ${invoiceItem.description}`,
         invoiceValue: money(invoiceItem.unitPrice),
         supportValue: money(supportItem.unitPrice),
@@ -811,6 +825,7 @@ export function verifyAgainstEvidence(
 
     if (Math.abs(invoiceItem.quantity - supportItem.quantity) > AMOUNT_EPSILON) {
       discrepancies.push({
+        reasonCode: 'QUANTITY_MISMATCH',
         field: `cantidad: ${invoiceItem.description}`,
         invoiceValue: String(invoiceItem.quantity),
         supportValue: String(supportItem.quantity),
@@ -821,6 +836,7 @@ export function verifyAgainstEvidence(
 
   for (const extra of unmatchedInvoice) {
     discrepancies.push({
+      reasonCode: 'ITEM_NOT_AUTHORIZED',
       field: `ítem no autorizado: ${extra.description}`,
       invoiceValue: `${currency} ${money(extra.amount)}`,
       supportValue: 'ausente',
@@ -838,7 +854,13 @@ export function verifyAgainstEvidence(
   if (discrepancies.length === 0) {
     // La evidencia respalda una coincidencia. Se conserva el resumen del
     // modelo, que suele redactarlo mejor que una plantilla.
-    return { ...rawAudit, verdict: 'MATCH', discrepancies: [], summary: `${rawAudit.summary}${caveat}` }
+    return {
+      ...rawAudit,
+      verdict: 'MATCH',
+      discrepancies: [],
+      summary: `${rawAudit.summary}${caveat}`,
+      reasonCode: null
+    }
   }
 
   return {
@@ -846,8 +868,32 @@ export function verifyAgainstEvidence(
     verdict: 'DISCREPANCY',
     confidence: 0.99,
     summary: `Contra ${supportDocumentId}: ${headline.join(' y ')}.${caveat}`,
-    discrepancies
+    discrepancies,
+    // El motivo principal es el de la primera discrepancia encontrada; el
+    // detalle completo viaja en cada entrada de `discrepancies`.
+    reasonCode: discrepancies[0]!.reasonCode
   }
+}
+
+/**
+ * Registra el número de factura de `file` en el mapa de vistos del lote y
+ * devuelve el archivo donde ese número YA había aparecido, o `null` si es la
+ * primera vez. Un número ilegible ("" tras normalizar) nunca se registra:
+ * dos facturas ilegibles no son duplicados entre sí, son dos incógnitas.
+ */
+export function registerInvoiceNumber(
+  seen: Map<string, string>,
+  invoiceNumber: string,
+  file: string
+): string | null {
+  const key = invoiceNumber.trim().toUpperCase()
+  if (key.length === 0) return null
+
+  const priorFile = seen.get(key)
+  if (priorFile !== undefined) return priorFile
+
+  seen.set(key, file)
+  return null
 }
 
 /**
@@ -904,6 +950,9 @@ export async function extractAndAudit(
     onProgress,
     async (modelId) => {
       const verdicts: ReconciliationVerdict[] = []
+      // Número de factura ya visto en este lote → archivo donde apareció.
+      // La detección de duplicados es código puro sobre lo ya extraído.
+      const seenInvoiceNumbers = new Map<string, string>()
 
       for (const [index, input] of inputs.entries()) {
         const name = path.basename(input.ocr.file)
@@ -967,6 +1016,46 @@ export async function extractAndAudit(
 
         const invoice = extraction.data
 
+        // Duplicado dentro del lote: el mismo número de factura ya apareció en
+        // un archivo anterior. Es una discrepancia establecida por código puro
+        // (una factura presentada dos veces se paga dos veces); se marca la
+        // ocurrencia posterior, referenciando al archivo original, sin llamar
+        // al modelo de auditoría.
+        const duplicateOf = registerInvoiceNumber(seenInvoiceNumbers, invoice.invoiceNumber, name)
+        if (duplicateOf !== null) {
+          verdicts.push({
+            file: name,
+            status: 'OK',
+            invoice,
+            audit: {
+              supportDocumentId: duplicateOf,
+              supportVendorName: '',
+              supportTotalAmount: 0,
+              supportCurrency: '',
+              supportItems: [],
+              discrepancies: [
+                {
+                  reasonCode: 'DUPLICATE_INVOICE',
+                  field: 'invoiceNumber',
+                  invoiceValue: invoice.invoiceNumber,
+                  supportValue: `ya presentada en ${duplicateOf}`,
+                  difference: `El número ${invoice.invoiceNumber} ya apareció en ${duplicateOf} dentro de este mismo lote; una factura presentada dos veces se paga dos veces.`
+                }
+              ],
+              verdict: 'DISCREPANCY',
+              confidence: 0.99,
+              summary: `Factura duplicada: ${invoice.invoiceNumber} ya fue presentada en ${duplicateOf}.`,
+              reasonCode: 'DUPLICATE_INVOICE'
+            },
+            matchedSupportDoc: duplicateOf,
+            supportScore: null,
+            error: null,
+            timings,
+            totalMs: now() - startedAll
+          })
+          continue
+        }
+
         // La factura cita una orden de compra que NO existe en el conjunto de
         // respaldos. Eso es un hecho establecido por búsqueda exacta, no una
         // impresión: el veredicto se decide acá, sin llamar al modelo. Caer a
@@ -986,7 +1075,8 @@ export async function extractAndAudit(
               discrepancies: [],
               verdict: 'UNCERTAIN',
               confidence: 0.3,
-              summary: `La factura cita ${input.evidence.citedPo} pero esa orden no aparece en ningún documento de respaldo; la factura puede carecer de respaldo real.`
+              summary: `La factura cita ${input.evidence.citedPo} pero esa orden no aparece en ningún documento de respaldo; la factura puede carecer de respaldo real.`,
+              reasonCode: 'PO_NOT_FOUND'
             },
             matchedSupportDoc: null,
             supportScore: null,
@@ -1071,7 +1161,8 @@ export async function extractAndAudit(
               discrepancies: [],
               verdict: 'UNCERTAIN',
               confidence: 0,
-              summary: `El modelo de auditoría no produjo un veredicto válido: ${audit.error}`
+              summary: `El modelo de auditoría no produjo un veredicto válido: ${audit.error}`,
+              reasonCode: 'MODEL_OUTPUT_INVALID'
             },
             matchedSupportDoc: bestLabel,
             supportScore,

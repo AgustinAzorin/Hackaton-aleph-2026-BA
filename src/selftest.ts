@@ -17,6 +17,7 @@ import {
   blocksToText,
   buildRetrievalQuery,
   listDocuments,
+  registerInvoiceNumber,
   sameVendor,
   supportLabel,
   verifyAgainstEvidence
@@ -68,10 +69,10 @@ await test('acepta PDF, PNG y JPG; rechaza el resto', () => {
   assert.equal(isSupportedDocument('hoja.xlsx'), false)
 })
 
-await test('lista las 6 facturas y las 5 órdenes de compra de samples/', async () => {
+await test('lista las 7 facturas y las 5 órdenes de compra de samples/', async () => {
   const invoices = await listDocuments(path.join(REPO_ROOT, 'samples/invoices'))
   const support = await listDocuments(path.join(REPO_ROOT, 'samples/support'))
-  assert.equal(invoices.length, 6, `esperaba 6 facturas, encontré ${invoices.length}`)
+  assert.equal(invoices.length, 7, `esperaba 7 facturas, encontré ${invoices.length}`)
   assert.equal(support.length, 5, `esperaba 5 órdenes de compra, encontré ${support.length}`)
   // Mezcla real de formatos: la corrida debe ejercitar ambas rutas de entrada.
   assert.ok(invoices.some((f) => f.endsWith('.pdf')), 'no hay ninguna factura en PDF')
@@ -420,10 +421,11 @@ console.log('\nSalvaguardas de evidencia insuficiente')
 await test('sin respaldo identificado el veredicto es UNCERTAIN', () => {
   const result = verifyAgainstEvidence(
     invoiceOf('Quantum Freight Systems', '', 3835, []),
-    supportOf('', '', 0, []),
+    supportOf('', '', 0, [], ''),
     null
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'NO_EVIDENCE')
 })
 
 await test('un total de respaldo ilegible impide declarar MATCH', () => {
@@ -433,6 +435,7 @@ await test('un total de respaldo ilegible impide declarar MATCH', () => {
     0.88
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'EVIDENCE_UNREADABLE')
 })
 
 await test('una referencia de PO que no coincide con el respaldo da UNCERTAIN', () => {
@@ -442,6 +445,7 @@ await test('una referencia de PO que no coincide con el respaldo da UNCERTAIN', 
     0.8
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'PO_NOT_FOUND')
   assert.ok(result.summary.includes('PO-5001'))
 })
 
@@ -452,6 +456,7 @@ await test('proveedor sin confirmar y recuperación floja da UNCERTAIN', () => {
     0.69
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'WEAK_RETRIEVAL')
 })
 
 await test('diferencias de centavo se toleran como redondeo', () => {
@@ -534,6 +539,7 @@ await test('un total de factura ilegible (0) da UNCERTAIN nombrando el campo', (
     0.88
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'MISSING_CRITICAL_FIELD')
   assert.deepEqual(result.discrepancies, [])
   assert.ok(result.summary.includes('totalAmount'), `debe nombrar el campo faltante: ${result.summary}`)
 })
@@ -603,6 +609,7 @@ await test('monedas distintas con montos iguales NO es MATCH: es UNCERTAIN sin a
     0.88
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'CURRENCY_MISMATCH')
   assert.deepEqual(result.discrepancies, [], 'una moneda distinta no debe producir acusaciones numéricas')
   assert.ok(result.summary.includes('ARS') && result.summary.includes('USD'), `el resumen debe explicar las monedas: ${result.summary}`)
 })
@@ -676,6 +683,7 @@ await test('un proveedor distinto degrada a UNCERTAIN, jamás a DISCREPANCY', ()
     0.88
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'VENDOR_MISMATCH')
   assert.deepEqual(result.discrepancies, [])
 })
 
@@ -752,6 +760,82 @@ await test('el verificador rechaza un respaldo de PO equivocado aunque la simili
   )
   assert.equal(result.verdict, 'UNCERTAIN')
   assert.deepEqual(result.discrepancies, [])
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nCódigos de motivo estructurados y duplicados')
+
+await test('el schema de discrepancias exige un reasonCode del enum', () => {
+  const schema = AUDIT_JSON_SCHEMA as {
+    properties: {
+      discrepancies: { items: { properties: { reasonCode?: { enum?: string[] } }; required: string[] } }
+    }
+  }
+  const items = schema.properties.discrepancies.items
+  assert.ok(items.required.includes('reasonCode'), 'reasonCode debería ser obligatorio')
+  assert.ok(
+    (items.properties.reasonCode?.enum?.length ?? 0) > 0,
+    'reasonCode debería estar restringido a un enum'
+  )
+})
+
+await test('un MATCH lleva reasonCode null; cada discrepancia lleva el suyo', () => {
+  const items = [item('A4 Copy Paper, 80gsm, ream', 40, 6.5)]
+  const match = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 260, items),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items),
+    0.88
+  )
+  assert.equal(match.reasonCode, null)
+})
+
+await test('la matriz de códigos cubre total, suma interna, ítems y precios', () => {
+  // Caso armado para disparar varias reglas a la vez, como INV-1003 + INV-1004.
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 4700, [
+      item('Container drayage, port to warehouse', 6, 540), // precio inflado
+      item('Fuel surcharge', 1, 420) // no autorizado
+    ]),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 4200, [
+      item('Container drayage, port to warehouse', 6, 520),
+      item('Palletizing service', 12, 90) // no facturado
+    ]),
+    0.86
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  const codes = new Set(result.discrepancies.map((d) => d.reasonCode))
+  assert.ok(codes.has('TOTAL_MISMATCH'), 'falta TOTAL_MISMATCH')
+  assert.ok(codes.has('INTERNAL_SUM_MISMATCH'), 'falta INTERNAL_SUM_MISMATCH')
+  assert.ok(codes.has('UNIT_PRICE_MISMATCH'), 'falta UNIT_PRICE_MISMATCH')
+  assert.ok(codes.has('ITEM_NOT_ON_INVOICE'), 'falta ITEM_NOT_ON_INVOICE')
+  assert.ok(codes.has('ITEM_NOT_AUTHORIZED'), 'falta ITEM_NOT_AUTHORIZED')
+  assert.equal(result.reasonCode, result.discrepancies[0]?.reasonCode)
+})
+
+await test('una cantidad distinta lleva QUANTITY_MISMATCH', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Cedar Hardware Supply', 'PO-5004', 1020, [item('Circular saw blade 190mm', 30, 34)]),
+    supportOf('PO-5004.pdf', 'Cedar Hardware Supply', 680, [item('Circular saw blade 190mm', 20, 34)]),
+    0.88
+  )
+  assert.ok(result.discrepancies.some((d) => d.reasonCode === 'QUANTITY_MISMATCH'))
+})
+
+await test('un número de factura repetido en el lote se detecta como duplicado', () => {
+  const seen = new Map<string, string>()
+  assert.equal(registerInvoiceNumber(seen, 'INV-1001', 'INV-1001.pdf'), null)
+  assert.equal(registerInvoiceNumber(seen, 'INV-1002', 'INV-1002.png'), null)
+  // La ocurrencia posterior referencia al archivo original, sin importar
+  // mayúsculas ni espacios alrededor.
+  assert.equal(registerInvoiceNumber(seen, ' inv-1001 ', 'INV-1007.pdf'), 'INV-1001.pdf')
+  // Y el original sigue registrado: un tercer reenvío también se marca.
+  assert.equal(registerInvoiceNumber(seen, 'INV-1001', 'INV-1008.pdf'), 'INV-1001.pdf')
+})
+
+await test('dos números de factura ilegibles NO son duplicados entre sí', () => {
+  const seen = new Map<string, string>()
+  assert.equal(registerInvoiceNumber(seen, '', 'borrosa-1.pdf'), null)
+  assert.equal(registerInvoiceNumber(seen, '   ', 'borrosa-2.pdf'), null)
 })
 
 // ---------------------------------------------------------------------------
