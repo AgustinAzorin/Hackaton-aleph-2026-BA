@@ -10,3 +10,4 @@ Generado por `samples/generate.ts`. El pipeline debería reproducir estos veredi
 | INV-1004 | PO-5004 | `DISCREPANCY` | Falta el ítem "Cordless drill 18V" (820.00) pero se factura el total completo de 2,920.00; los ítems detallados suman 2,100.00. |
 | INV-1005 | — | `UNCERTAIN` | No existe orden de compra de respaldo; no hay evidencia para validar. |
 | INV-1006 | PO-5006 | `DISCREPANCY` | Precio unitario de "Archive box" inflado 12.00 → 13.50 (915.00 vs 840.00). |
+| INV-1007 | PO-5001 | `DISCREPANCY` | Duplicado: mismo número de factura (INV-1001) ya presentado en INV-1001.pdf; se marca la ocurrencia posterior con DUPLICATE_INVOICE. |

@@ -29,6 +29,12 @@ interface Doc {
   kind: 'INVOICE' | 'PURCHASE ORDER'
   /** Número de factura u orden de compra. */
   number: string
+  /**
+   * Nombre de archivo de salida, sin extensión. Por defecto es `number`; se
+   * separa para poder plantar un DUPLICADO: dos archivos distintos con el
+   * mismo número de factura impreso.
+   */
+  fileName?: string
   vendor: string
   vendorAddress: string
   date: string
@@ -297,6 +303,19 @@ const INV_1005: Doc = {
   notes: 'Emergency shipment authorized verbally by operations.'
 }
 
+/**
+ * INV-1007.pdf — DISCREPANCIA: reenvío duplicado de INV-1001. El archivo es
+ * otro pero el número de factura impreso es el mismo; sin detección de
+ * duplicados, una factura presentada dos veces se paga dos veces. Se archiva
+ * como INV-1007.pdf para que el orden alfabético procese primero el original.
+ */
+const INV_1007: Doc = {
+  ...INV_1001,
+  fileName: 'INV-1007',
+  date: '2026-07-29',
+  notes: 'Resubmitted copy of invoice INV-1001 (sent again after a payment status inquiry).'
+}
+
 /** PO-5006 / INV-1006 — DISCREPANCIA: precio unitario inflado (12.00 → 13.50). */
 const PO_5006: Doc = {
   kind: 'PURCHASE ORDER',
@@ -334,7 +353,8 @@ const EXPECTED = [
   ['INV-1003', 'PO-5003', 'DISCREPANCY', 'Recargo de combustible de 420.00 no autorizado en el PO (4,620.00 vs 4,200.00).'],
   ['INV-1004', 'PO-5004', 'DISCREPANCY', 'Falta el ítem "Cordless drill 18V" (820.00) pero se factura el total completo de 2,920.00; los ítems detallados suman 2,100.00.'],
   ['INV-1005', '—', 'UNCERTAIN', 'No existe orden de compra de respaldo; no hay evidencia para validar.'],
-  ['INV-1006', 'PO-5006', 'DISCREPANCY', 'Precio unitario de "Archive box" inflado 12.00 → 13.50 (915.00 vs 840.00).']
+  ['INV-1006', 'PO-5006', 'DISCREPANCY', 'Precio unitario de "Archive box" inflado 12.00 → 13.50 (915.00 vs 840.00).'],
+  ['INV-1007', 'PO-5001', 'DISCREPANCY', 'Duplicado: mismo número de factura (INV-1001) ya presentado en INV-1001.pdf; se marca la ocurrencia posterior con DUPLICATE_INVOICE.']
 ] as const
 
 /**
@@ -365,7 +385,7 @@ function assertArithmetic(doc: Doc): void {
 }
 
 async function main() {
-  for (const doc of [PO_5001, PO_5002, PO_5003, PO_5004, PO_5006, INV_1001, INV_1002, INV_1003, INV_1004, INV_1005, INV_1006]) {
+  for (const doc of [PO_5001, PO_5002, PO_5003, PO_5004, PO_5006, INV_1001, INV_1002, INV_1003, INV_1004, INV_1005, INV_1006, INV_1007]) {
     assertArithmetic(doc)
   }
 
@@ -382,22 +402,24 @@ async function main() {
   }
 
   // Facturas: mezcla de PDF nativo y PNG "escaneado" para ejercitar ambas ramas.
-  const asPdf = [INV_1001, INV_1003, INV_1005, INV_1006]
+  const asPdf = [INV_1001, INV_1003, INV_1005, INV_1006, INV_1007]
   const asPng = [INV_1002, INV_1004]
 
   for (const inv of asPdf) {
-    const out = path.join(INVOICES_DIR, `${inv.number}.pdf`)
+    const base = inv.fileName ?? inv.number
+    const out = path.join(INVOICES_DIR, `${base}.pdf`)
     await renderPdf(inv, out)
-    console.log(`  invoices/ ${inv.number}.pdf`)
+    console.log(`  invoices/ ${base}.pdf`)
   }
 
   for (const inv of asPng) {
-    const tmpPdf = path.join(INVOICES_DIR, `.${inv.number}.tmp.pdf`)
-    const out = path.join(INVOICES_DIR, `${inv.number}.png`)
+    const base = inv.fileName ?? inv.number
+    const tmpPdf = path.join(INVOICES_DIR, `.${base}.tmp.pdf`)
+    const out = path.join(INVOICES_DIR, `${base}.png`)
     await renderPdf(inv, tmpPdf)
     await rasterizeToPng(tmpPdf, out)
     await rm(tmpPdf, { force: true })
-    console.log(`  invoices/ ${inv.number}.png`)
+    console.log(`  invoices/ ${base}.png`)
   }
 
   // Tabla de ground truth, para contrastar contra la salida del pipeline.

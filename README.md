@@ -50,7 +50,7 @@ npm run cli -- --json
 Chequeos rápidos, sin necesidad de descargar los modelos:
 
 ```bash
-npm run verify     # 30 pruebas: rasterización, OCR, RAG, schemas y verificación determinista
+npm run verify     # 64 pruebas: rasterización, OCR, retrieval híbrido, schemas y verificación determinista
 npm run typecheck
 ```
 
@@ -74,6 +74,8 @@ Corrida real contra `samples/` en un MacBook Air, con los seis veredictos coinci
 | INV-1004 | `DISCREPANCY` | Los ítems suman 2.100 contra un total de 2.920, y falta el taladro de 820,00 del PO |
 | INV-1005 | `UNCERTAIN` | Sin orden de compra de respaldo; no hay evidencia |
 | INV-1006 | `DISCREPANCY` | Total excede el PO en 75,00; precio unitario facturado a 13,50 contra 12,00 autorizado |
+
+> INV-1007 (duplicado de INV-1001) se agregó después de esa corrida. Su veredicto esperado es `DISCREPANCY` con código `DUPLICATE_INVOICE`, decidido por código puro (mismo número de factura ya visto en el lote), sin pasar por el modelo de auditoría.
 
 Alrededor de 30 segundos por factura de punta a punta (OCR, extracción y auditoría), con los tres modelos cargándose y descargándose por fase.
 
@@ -100,6 +102,18 @@ El pipeline corre en **tres fases secuenciales, con un solo modelo grande vivo p
 ```
 
 Por eso la búsqueda RAG ocurre en la fase 2 y no dentro de la auditoría: recuperar durante la fase 3 exigiría tener el modelo de embeddings y el LLM cargados al mismo tiempo, que es exactamente lo que el presupuesto de memoria prohíbe.
+
+### Recuperación híbrida: PO exacto primero, semántica como último recurso
+
+Cuando una factura cita explícitamente una orden de compra ("PO Reference: PO-5003"), buscarla por similitud semántica es usar la herramienta equivocada: un embedding puede traer con score alto una orden *parecida* pero ajena, y comparar contra el documento equivocado produce acusaciones falsas. Una cita es un identificador, y los identificadores se resuelven por igualdad.
+
+La fase 2 resuelve la evidencia en este orden ([`src/services/retrieval.ts`](src/services/retrieval.ts)):
+
+1. **Coincidencia exacta.** Si la factura cita un PO, se lo busca — normalizado por mayúsculas, guiones y espacios — contra los nombres de archivo de los respaldos y contra los números de PO que aparecen en su texto OCR. Si aparece, **ese documento es la evidencia**, y a la auditoría le llega su texto OCR completo, no un fragmento RAG. Este paso es puro trabajo de strings sobre OCR ya calculado: corre sin ningún modelo cargado y no le cuesta nada al presupuesto de memoria.
+2. **PO citado pero ausente.** Si la orden citada no aparece en *ningún* respaldo, la factura queda `UNCERTAIN` con motivo `PO_NOT_FOUND`: puede carecer de respaldo real, y el reporte lo dice. Deliberadamente **no** se cae a la búsqueda semántica "a ver si hay algo parecido" — un PO parecido pero equivocado es peor que ningún PO.
+3. **Sin PO citado.** Recién ahí entra la búsqueda semántica de siempre (top-3), con las salvaguardas existentes de proveedor y score mínimo de recuperación.
+
+Si todas las facturas del lote citan un PO resoluble, el modelo de embeddings ni siquiera se carga.
 
 **La ruta principal es OCR → texto plano → LLM de texto.** No depende de que entre un modelo multimodal en memoria; el multimodal queda como mejora opcional, no como requisito.
 
@@ -129,6 +143,12 @@ El punto 3 es lo que hace detectable el caso más difícil (INV-1004): ahí los 
 Ese mismo chequeo tiene una salvaguarda, porque compara dos números que salen del mismo OCR: si el importe de algún renglón no cierra con su cantidad por su precio unitario, el que no es confiable es el OCR y no la factura, así que no se acusa a nadie. En una corrida real, un importe mal leído había producido un desvío inexistente de 1.500.
 
 Y en la corrida en que se agregó, este chequeo encontró **dos totales mal tipeados en los propios datos de prueba**. El generador ahora verifica su aritmética antes de escribir nada.
+
+### Códigos de motivo estructurados
+
+Cada discrepancia y cada veredicto no-MATCH llevan un `reasonCode` legible por máquina (`TOTAL_MISMATCH`, `INTERNAL_SUM_MISMATCH`, `UNIT_PRICE_MISMATCH`, `QUANTITY_MISMATCH`, `ITEM_NOT_ON_INVOICE`, `ITEM_NOT_AUTHORIZED`, `CURRENCY_MISMATCH`, `PO_NOT_FOUND`, `VENDOR_MISMATCH`, `NO_EVIDENCE`, `WEAK_RETRIEVAL`, `EVIDENCE_UNREADABLE`, `MISSING_CRITICAL_FIELD`, `DUPLICATE_INVOICE`, `MODEL_OUTPUT_INVALID`). Los emite exclusivamente el verificador determinista, así que "¿por qué el sistema decidió esto?" se responde sin volver a preguntarle al LLM: cada código es trazable a una regla concreta del código. La `confidence` del modelo sigue siendo cosmética — se muestra en el reporte, pero jamás participa de ninguna decisión.
+
+Además, dos monedas distintas entre factura y respaldo hacen los montos incomparables (`CURRENCY_MISMATCH` → `UNCERTAIN`, sin conversión implícita ni acusaciones numéricas), y un mismo número de factura repetido dentro del lote marca la ocurrencia posterior como `DUPLICATE_INVOICE`, referenciando el archivo original — detección 100% en código, sin modelo.
 
 ### Manejo de incertidumbre
 
@@ -181,7 +201,7 @@ Toda la inferencia vive en un solo archivo, [`src/services/qvacService.ts`](src/
 
 ## Datos de prueba
 
-`npm run samples` genera 6 facturas y 5 órdenes de compra con discrepancias plantadas a propósito, más [`samples/EXPECTED.md`](samples/EXPECTED.md) con el veredicto esperado de cada caso:
+`npm run samples` genera 7 facturas y 5 órdenes de compra con discrepancias plantadas a propósito, más [`samples/EXPECTED.md`](samples/EXPECTED.md) con el veredicto esperado de cada caso:
 
 | Factura | Formato | Caso |
 | --- | --- | --- |
@@ -191,6 +211,7 @@ Toda la inferencia vive en un solo archivo, [`src/services/qvacService.ts`](src/
 | INV-1004 | PNG | falta un ítem del PO (820,00) pero se factura el total completo de 2.920,00 |
 | INV-1005 | PDF | sin orden de compra de respaldo → debe dar `UNCERTAIN` |
 | INV-1006 | PDF | precio unitario inflado de 12,00 a 13,50 |
+| INV-1007 | PDF | reenvío duplicado de INV-1001 (mismo número de factura) → `DUPLICATE_INVOICE` |
 
 Las facturas vienen en PDF y en PNG a propósito, para que cada corrida ejercite tanto la rama de rasterización como la de imagen directa.
 

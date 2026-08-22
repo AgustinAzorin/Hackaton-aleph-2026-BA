@@ -79,12 +79,13 @@ function printReport(verdicts: ReconciliationVerdict[]): void {
     }
 
     if (audit) {
+      const code = audit.reasonCode !== null ? `${paint('cyan', `[${audit.reasonCode}]`)} ` : ''
       console.log(
-        `               ${audit.summary} ${paint('dim', `(confianza ${(audit.confidence * 100).toFixed(0)}%)`)}`
+        `               ${code}${audit.summary} ${paint('dim', `(confianza ${(audit.confidence * 100).toFixed(0)}%)`)}`
       )
       for (const d of audit.discrepancies) {
         console.log(
-          `                 ${paint('cyan', '·')} ${d.field}: factura ${d.invoiceValue} vs respaldo ${d.supportValue} — ${d.difference}`
+          `                 ${paint('cyan', '·')} [${d.reasonCode}] ${d.field}: factura ${d.invoiceValue} vs respaldo ${d.supportValue} — ${d.difference}`
         )
       }
     }

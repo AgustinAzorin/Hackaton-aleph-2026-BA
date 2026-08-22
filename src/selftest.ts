@@ -17,9 +17,19 @@ import {
   blocksToText,
   buildRetrievalQuery,
   listDocuments,
+  registerInvoiceNumber,
+  sameVendor,
   supportLabel,
   verifyAgainstEvidence
 } from './services/qvacService.js'
+import {
+  missingCriticalFields,
+  normalizeAmount,
+  normalizeCurrency,
+  normalizeInvoice,
+  normalizeText
+} from './services/normalize.js'
+import { canonicalPo, findCitedPo, resolvePoEvidence } from './services/retrieval.js'
 import {
   AUDIT_JSON_SCHEMA,
   AuditResultSchema,
@@ -59,10 +69,10 @@ await test('acepta PDF, PNG y JPG; rechaza el resto', () => {
   assert.equal(isSupportedDocument('hoja.xlsx'), false)
 })
 
-await test('lista las 6 facturas y las 5 órdenes de compra de samples/', async () => {
+await test('lista las 7 facturas y las 5 órdenes de compra de samples/', async () => {
   const invoices = await listDocuments(path.join(REPO_ROOT, 'samples/invoices'))
   const support = await listDocuments(path.join(REPO_ROOT, 'samples/support'))
-  assert.equal(invoices.length, 6, `esperaba 6 facturas, encontré ${invoices.length}`)
+  assert.equal(invoices.length, 7, `esperaba 7 facturas, encontré ${invoices.length}`)
   assert.equal(support.length, 5, `esperaba 5 órdenes de compra, encontré ${support.length}`)
   // Mezcla real de formatos: la corrida debe ejercitar ambas rutas de entrada.
   assert.ok(invoices.some((f) => f.endsWith('.pdf')), 'no hay ninguna factura en PDF')
@@ -230,12 +240,18 @@ const item = (description: string, quantity: number, unitPrice: number) => ({
 })
 
 /** Factura con ítems que suman su total, salvo que se indique lo contrario. */
-const invoiceOf = (vendorName: string, poReference: string, totalAmount: number, items: LineItem[]) => ({
+const invoiceOf = (
+  vendorName: string,
+  poReference: string,
+  totalAmount: number,
+  items: LineItem[],
+  currency = 'USD'
+) => ({
   invoiceNumber: 'INV-0000',
   vendorName,
   date: '2026-07-01',
   totalAmount,
-  currency: 'USD',
+  currency,
   poReference,
   items
 })
@@ -245,11 +261,13 @@ const supportOf = (
   supportDocumentId: string,
   supportVendorName: string,
   supportTotalAmount: number,
-  supportItems: LineItem[]
+  supportItems: LineItem[],
+  supportCurrency = 'USD'
 ) => ({
   supportDocumentId,
   supportVendorName,
   supportTotalAmount,
+  supportCurrency,
   supportItems,
   discrepancies: [],
   verdict: 'MATCH' as const,
@@ -403,10 +421,11 @@ console.log('\nSalvaguardas de evidencia insuficiente')
 await test('sin respaldo identificado el veredicto es UNCERTAIN', () => {
   const result = verifyAgainstEvidence(
     invoiceOf('Quantum Freight Systems', '', 3835, []),
-    supportOf('', '', 0, []),
+    supportOf('', '', 0, [], ''),
     null
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'NO_EVIDENCE')
 })
 
 await test('un total de respaldo ilegible impide declarar MATCH', () => {
@@ -416,6 +435,7 @@ await test('un total de respaldo ilegible impide declarar MATCH', () => {
     0.88
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'EVIDENCE_UNREADABLE')
 })
 
 await test('una referencia de PO que no coincide con el respaldo da UNCERTAIN', () => {
@@ -425,6 +445,7 @@ await test('una referencia de PO que no coincide con el respaldo da UNCERTAIN', 
     0.8
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'PO_NOT_FOUND')
   assert.ok(result.summary.includes('PO-5001'))
 })
 
@@ -435,6 +456,7 @@ await test('proveedor sin confirmar y recuperación floja da UNCERTAIN', () => {
     0.69
   )
   assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'WEAK_RETRIEVAL')
 })
 
 await test('diferencias de centavo se toleran como redondeo', () => {
@@ -471,6 +493,352 @@ await test('una variación menor de OCR no convierte un ítem en faltante', () =
 })
 
 // ---------------------------------------------------------------------------
+console.log('\nNormalización de valores faltantes (centinelas "" y 0 → null)')
+
+await test('los centinelas de texto y monto se convierten en null explícito', () => {
+  assert.equal(normalizeText(''), null)
+  assert.equal(normalizeText('   '), null)
+  assert.equal(normalizeText(' PO-5001 '), 'PO-5001')
+  // Un total de exactamente 0 es evidencia ilegible, no una factura de 0,00:
+  // decisión conservadora documentada en normalize.ts.
+  assert.equal(normalizeAmount(0), null)
+  assert.equal(normalizeAmount(-5), null)
+  assert.equal(normalizeAmount(Number.NaN), null)
+  assert.equal(normalizeAmount(1840), 1840)
+})
+
+await test('la moneda se normaliza a ISO de tres letras o null', () => {
+  assert.equal(normalizeCurrency(' usd '), 'USD')
+  assert.equal(normalizeCurrency('ARS'), 'ARS')
+  assert.equal(normalizeCurrency('eur'), 'EUR')
+  assert.equal(normalizeCurrency(''), null)
+  assert.equal(normalizeCurrency('$'), null)
+  assert.equal(normalizeCurrency('dolares'), null)
+})
+
+await test('missingCriticalFields nombra exactamente lo que falta', () => {
+  const complete = normalizeInvoice(invoiceOf('Acme', 'PO-5001', 100, []))
+  assert.deepEqual(missingCriticalFields(complete), [])
+
+  const broken = normalizeInvoice({
+    invoiceNumber: '',
+    vendorName: 'Acme',
+    date: '',
+    totalAmount: 0,
+    currency: 'USD',
+    poReference: '',
+    items: []
+  })
+  assert.deepEqual(missingCriticalFields(broken), ['invoiceNumber', 'totalAmount'])
+})
+
+await test('un total de factura ilegible (0) da UNCERTAIN nombrando el campo', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 0, []),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'MISSING_CRITICAL_FIELD')
+  assert.deepEqual(result.discrepancies, [])
+  assert.ok(result.summary.includes('totalAmount'), `debe nombrar el campo faltante: ${result.summary}`)
+})
+
+await test('un proveedor de factura ilegible da UNCERTAIN, no una comparación a ciegas', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('', 'PO-5001', 1840, []),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.ok(result.summary.includes('vendorName'))
+})
+
+await test('una moneda de factura ilegible da UNCERTAIN nombrando el campo', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 1840, [], ''),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.ok(result.summary.includes('currency'), `debe nombrar la moneda faltante: ${result.summary}`)
+})
+
+await test('fecha y PO faltantes NO bloquean por sí solos el veredicto', () => {
+  // Campos no críticos: la factura sin fecha ni PO citado todavía se compara.
+  const items = [item('A4 Copy Paper, 80gsm, ream', 40, 6.5)]
+  const invoice = { ...invoiceOf('Acme Office Supplies LLC', '', 260, items), date: '' }
+  const result = verifyAgainstEvidence(
+    invoice,
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items),
+    0.88
+  )
+  assert.equal(result.verdict, 'MATCH')
+})
+
+await test('una factura sin ítems detallados aún permite comparar totales', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 2000, []),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 1840, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(result.discrepancies.some((d) => d.field === 'total'))
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nMonedas (los montos sólo son comparables en la misma moneda)')
+
+await test('misma moneda en ambos documentos permite MATCH', () => {
+  const items = [item('A4 Copy Paper, 80gsm, ream', 40, 6.5)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 260, items, 'USD'),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items, 'usd '),
+    0.88
+  )
+  assert.equal(result.verdict, 'MATCH', 'la normalización de moneda no debería distinguir mayúsculas')
+})
+
+await test('monedas distintas con montos iguales NO es MATCH: es UNCERTAIN sin acusaciones', () => {
+  // ARS 1000 contra USD 1000 no son comparables; convertir implícitamente
+  // sería inventar un tipo de cambio que el sistema no tiene.
+  const items = [item('Servicio de flete', 1, 1000)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 1000, items, 'ARS'),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 1000, items, 'USD'),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'CURRENCY_MISMATCH')
+  assert.deepEqual(result.discrepancies, [], 'una moneda distinta no debe producir acusaciones numéricas')
+  assert.ok(result.summary.includes('ARS') && result.summary.includes('USD'), `el resumen debe explicar las monedas: ${result.summary}`)
+})
+
+await test('monedas distintas también bloquean cuando los montos difieren', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 999999, [], 'EUR'),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 1000, [], 'ARS'),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.deepEqual(result.discrepancies, [])
+})
+
+await test('moneda del respaldo ilegible: los montos se comparan pero el resumen lo advierte', () => {
+  const items = [item('A4 Copy Paper, 80gsm, ream', 40, 6.5)]
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 260, items, 'USD'),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items, ''),
+    0.88
+  )
+  assert.equal(result.verdict, 'MATCH', 'sin moneda de respaldo los chequeos numéricos deben seguir corriendo')
+  assert.ok(result.summary.includes('sin verificar'), `el resumen debe advertir la moneda sin verificar: ${result.summary}`)
+})
+
+await test('moneda del respaldo ilegible no tapa una discrepancia numérica', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5006', 915, []),
+    supportOf('PO-5006.pdf', 'Acme Office Supplies LLC', 840, [], ''),
+    0.87
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  assert.ok(result.summary.includes('sin verificar'))
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nIdentidad de proveedor (jerarquía conservadora)')
+
+await test('la normalización iguala variantes de puntuación y sufijo societario', () => {
+  assert.equal(sameVendor('ACME S.A.', 'acme sa'), true)
+  assert.equal(sameVendor('ACME S.A.', 'ACME S.A'), true)
+  assert.equal(sameVendor('acme sa', 'ACME S.A'), true)
+})
+
+await test('compartir un solo rubro NO prueba identidad', () => {
+  // La regresión que motiva el cambio: con la regla vieja de "cualquier token
+  // compartido", estas dos empresas distintas se consideraban la misma.
+  assert.equal(sameVendor('Acme Logistics', 'Beta Logistics'), false)
+  assert.equal(sameVendor('Quantum Freight Systems', 'Northwind Logistics Inc.'), false)
+})
+
+await test('el sufijo societario no impide reconocer al mismo proveedor (nivel 1)', () => {
+  assert.equal(sameVendor('Northwind Logistics Inc.', 'Northwind Logistics'), true)
+})
+
+await test('un token garbleado por OCR en un nombre de tres palabras aún coincide', () => {
+  assert.equal(sameVendor('Quantum Freight Syst3ms', 'Quantum Freight Systems'), true)
+})
+
+await test('en un nombre de dos palabras, un token garbleado degrada a distinto (conservador)', () => {
+  // Con la mitad del nombre ilegible ya no hay mayoría de tokens compartidos.
+  // El costo es un UNCERTAIN de más — nunca una acusación contra el proveedor
+  // equivocado, que es el fallo caro.
+  assert.equal(sameVendor('Northwind Log1stics', 'Northwind Logistics'), false)
+})
+
+await test('un proveedor distinto degrada a UNCERTAIN, jamás a DISCREPANCY', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Acme Logistics', 'PO-5003', 4620, []),
+    supportOf('PO-5003.pdf', 'Beta Logistics', 4200, []),
+    0.88
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.equal(result.reasonCode, 'VENDOR_MISMATCH')
+  assert.deepEqual(result.discrepancies, [])
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nRecuperación híbrida (PO exacto primero, semántica como último recurso)')
+
+await test('la forma canónica de un PO ignora prefijo, guiones y mayúsculas', () => {
+  assert.equal(canonicalPo('PO-5003'), '5003')
+  assert.equal(canonicalPo('po 5003'), '5003')
+  assert.equal(canonicalPo('PO5003'), '5003')
+  assert.equal(canonicalPo('5003'), '5003')
+  assert.equal(canonicalPo('PO-AB-123'), 'AB123')
+})
+
+await test('encuentra el PO citado en el texto OCR de una factura', () => {
+  const cited = findCitedPo('INVOICE\nCedar Hardware Supply\nInvoice Number: INV-1004\nPO Reference: PO-5004\nDate: 2026-07-24')
+  assert.ok(cited !== null, 'no encontró la cita')
+  assert.equal(cited.canonical, '5004')
+})
+
+await test('"P.O. Box" de una dirección no se confunde con una cita de PO', () => {
+  assert.equal(findCitedPo('Acme LLC\nP.O. Box Newark NJ\nInvoice INV-9'), null)
+  assert.equal(findCitedPo('factura sin ninguna referencia'), null)
+})
+
+const supportSet = [
+  { file: '/support/PO-5001.pdf', text: 'PURCHASE ORDER\nAcme Office Supplies LLC\nPO Number: PO-5001\nTOTAL USD 1,840.00' },
+  { file: '/support/PO-5003.pdf', text: 'PURCHASE ORDER\nNorthwind Logistics Inc.\nPO Number: PO-5003\nTOTAL USD 4,200.00' },
+  { file: '/support/orden_julio.pdf', text: 'PURCHASE ORDER\nBolt & Nut Co.\nPO Number: PO-7788\nTOTAL USD 900.00' }
+]
+
+await test('un PO citado se resuelve exacto contra el nombre de archivo', () => {
+  const result = resolvePoEvidence('INVOICE\nAcme\nPO Reference: PO-5001\nTOTAL 1840', supportSet)
+  assert.equal(result.kind, 'exact')
+  assert.ok(result.kind === 'exact' && result.doc.file.endsWith('PO-5001.pdf'))
+})
+
+await test('un PO citado se resuelve exacto contra el texto OCR aunque el archivo tenga otro nombre', () => {
+  const result = resolvePoEvidence('INVOICE\nBolt & Nut Co.\nPO Reference: PO-7788', supportSet)
+  assert.equal(result.kind, 'exact')
+  assert.ok(result.kind === 'exact' && result.doc.file.endsWith('orden_julio.pdf'))
+})
+
+await test('un PO citado ausente del conjunto ENTERO da not-found, nunca "algo parecido"', () => {
+  // El conjunto contiene órdenes muy similares en contenido; nada de eso
+  // importa: la cita es un identificador y el identificador no está.
+  const result = resolvePoEvidence('INVOICE\nNorthwind Logistics Inc.\nPO Reference: PO-5099\nContainer drayage, port to warehouse', supportSet)
+  assert.equal(result.kind, 'not-found')
+  assert.ok(result.kind === 'not-found' && result.citedPo.includes('5099'))
+})
+
+await test('sin PO citado la resolución delega en la búsqueda semántica', () => {
+  const result = resolvePoEvidence('INVOICE\nQuantum Freight Systems\nExpedited air freight', supportSet)
+  assert.equal(result.kind, 'no-po')
+})
+
+await test('con dos respaldos de contenido casi idéntico gana el del PO citado', () => {
+  const twins = [
+    { file: '/support/PO-9001.pdf', text: 'PURCHASE ORDER\nAcme LLC\nPO Number: PO-9001\nWidget A 10 x 5.00\nTOTAL USD 50.00' },
+    { file: '/support/PO-9002.pdf', text: 'PURCHASE ORDER\nAcme LLC\nPO Number: PO-9002\nWidget A 10 x 5.00\nTOTAL USD 50.00' }
+  ]
+  const result = resolvePoEvidence('INVOICE\nAcme LLC\nPO Reference: PO-9002', twins)
+  assert.equal(result.kind, 'exact')
+  assert.ok(result.kind === 'exact' && result.doc.file.endsWith('PO-9002.pdf'))
+})
+
+await test('el verificador rechaza un respaldo de PO equivocado aunque la similitud sea alta', () => {
+  // Cinturón y tiradores: si a pesar de todo llegara un respaldo ajeno con
+  // score semántico alto, la referencia citada sigue mandando.
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5099', 4620, []),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 4200, []),
+    0.95
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.deepEqual(result.discrepancies, [])
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nCódigos de motivo estructurados y duplicados')
+
+await test('el schema de discrepancias exige un reasonCode del enum', () => {
+  const schema = AUDIT_JSON_SCHEMA as {
+    properties: {
+      discrepancies: { items: { properties: { reasonCode?: { enum?: string[] } }; required: string[] } }
+    }
+  }
+  const items = schema.properties.discrepancies.items
+  assert.ok(items.required.includes('reasonCode'), 'reasonCode debería ser obligatorio')
+  assert.ok(
+    (items.properties.reasonCode?.enum?.length ?? 0) > 0,
+    'reasonCode debería estar restringido a un enum'
+  )
+})
+
+await test('un MATCH lleva reasonCode null; cada discrepancia lleva el suyo', () => {
+  const items = [item('A4 Copy Paper, 80gsm, ream', 40, 6.5)]
+  const match = verifyAgainstEvidence(
+    invoiceOf('Acme Office Supplies LLC', 'PO-5001', 260, items),
+    supportOf('PO-5001.pdf', 'Acme Office Supplies LLC', 260, items),
+    0.88
+  )
+  assert.equal(match.reasonCode, null)
+})
+
+await test('la matriz de códigos cubre total, suma interna, ítems y precios', () => {
+  // Caso armado para disparar varias reglas a la vez, como INV-1003 + INV-1004.
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5003', 4700, [
+      item('Container drayage, port to warehouse', 6, 540), // precio inflado
+      item('Fuel surcharge', 1, 420) // no autorizado
+    ]),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 4200, [
+      item('Container drayage, port to warehouse', 6, 520),
+      item('Palletizing service', 12, 90) // no facturado
+    ]),
+    0.86
+  )
+  assert.equal(result.verdict, 'DISCREPANCY')
+  const codes = new Set(result.discrepancies.map((d) => d.reasonCode))
+  assert.ok(codes.has('TOTAL_MISMATCH'), 'falta TOTAL_MISMATCH')
+  assert.ok(codes.has('INTERNAL_SUM_MISMATCH'), 'falta INTERNAL_SUM_MISMATCH')
+  assert.ok(codes.has('UNIT_PRICE_MISMATCH'), 'falta UNIT_PRICE_MISMATCH')
+  assert.ok(codes.has('ITEM_NOT_ON_INVOICE'), 'falta ITEM_NOT_ON_INVOICE')
+  assert.ok(codes.has('ITEM_NOT_AUTHORIZED'), 'falta ITEM_NOT_AUTHORIZED')
+  assert.equal(result.reasonCode, result.discrepancies[0]?.reasonCode)
+})
+
+await test('una cantidad distinta lleva QUANTITY_MISMATCH', () => {
+  const result = verifyAgainstEvidence(
+    invoiceOf('Cedar Hardware Supply', 'PO-5004', 1020, [item('Circular saw blade 190mm', 30, 34)]),
+    supportOf('PO-5004.pdf', 'Cedar Hardware Supply', 680, [item('Circular saw blade 190mm', 20, 34)]),
+    0.88
+  )
+  assert.ok(result.discrepancies.some((d) => d.reasonCode === 'QUANTITY_MISMATCH'))
+})
+
+await test('un número de factura repetido en el lote se detecta como duplicado', () => {
+  const seen = new Map<string, string>()
+  assert.equal(registerInvoiceNumber(seen, 'INV-1001', 'INV-1001.pdf'), null)
+  assert.equal(registerInvoiceNumber(seen, 'INV-1002', 'INV-1002.png'), null)
+  // La ocurrencia posterior referencia al archivo original, sin importar
+  // mayúsculas ni espacios alrededor.
+  assert.equal(registerInvoiceNumber(seen, ' inv-1001 ', 'INV-1007.pdf'), 'INV-1001.pdf')
+  // Y el original sigue registrado: un tercer reenvío también se marca.
+  assert.equal(registerInvoiceNumber(seen, 'INV-1001', 'INV-1008.pdf'), 'INV-1001.pdf')
+})
+
+await test('dos números de factura ilegibles NO son duplicados entre sí', () => {
+  const seen = new Map<string, string>()
+  assert.equal(registerInvoiceNumber(seen, '', 'borrosa-1.pdf'), null)
+  assert.equal(registerInvoiceNumber(seen, '   ', 'borrosa-2.pdf'), null)
+})
+
+// ---------------------------------------------------------------------------
 console.log('\nEtiqueta del documento de respaldo')
 
 await test('recupera el nombre de archivo del prefijo del fragmento', () => {
@@ -491,6 +859,7 @@ await test('la evidencia precede al veredicto en el JSON Schema', () => {
     'supportDocumentId',
     'supportVendorName',
     'supportTotalAmount',
+    'supportCurrency',
     'supportItems',
     'discrepancies'
   ]) {

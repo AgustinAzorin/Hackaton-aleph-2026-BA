@@ -47,7 +47,37 @@ export type InvoiceData = z.infer<typeof InvoiceDataSchema>
 export const VerdictSchema = z.enum(['MATCH', 'DISCREPANCY', 'UNCERTAIN'])
 export type Verdict = z.infer<typeof VerdictSchema>
 
+/**
+ * Motivos legibles por máquina. "¿Por qué el sistema decidió esto?" se
+ * responde con estos códigos, sin volver a preguntarle al LLM. Los emite
+ * exclusivamente el verificador determinista (el modelo deja `discrepancies`
+ * vacío), así que cada código es trazable a una regla de código concreta.
+ */
+export const ReasonCodeSchema = z.enum([
+  // Discrepancias numéricas y de ítems
+  'TOTAL_MISMATCH',
+  'INTERNAL_SUM_MISMATCH',
+  'UNIT_PRICE_MISMATCH',
+  'QUANTITY_MISMATCH',
+  'ITEM_NOT_ON_INVOICE',
+  'ITEM_NOT_AUTHORIZED',
+  'DUPLICATE_INVOICE',
+  // Motivos de incertidumbre
+  'CURRENCY_MISMATCH',
+  'PO_NOT_FOUND',
+  'VENDOR_MISMATCH',
+  'NO_EVIDENCE',
+  'WEAK_RETRIEVAL',
+  'EVIDENCE_UNREADABLE',
+  'MISSING_CRITICAL_FIELD',
+  'MODEL_OUTPUT_INVALID'
+])
+
+export type ReasonCode = z.infer<typeof ReasonCodeSchema>
+
 export const DiscrepancyReportSchema = z.object({
+  /** Motivo estructurado del desvío, emitido por el verificador determinista. */
+  reasonCode: ReasonCodeSchema,
   /** Campo en conflicto: "totalAmount", "lineItem: Cordless drill 18V", etc. */
   field: z.string(),
   invoiceValue: z.string(),
@@ -75,6 +105,12 @@ export const AuditResultSchema = z.object({
   supportVendorName: z.string(),
   /** Total leído del documento de respaldo; 0 si no se pudo leer. */
   supportTotalAmount: z.number(),
+  /**
+   * Código de moneda impreso en el respaldo (ISO, p. ej. "USD"); "" si no se
+   * pudo leer. Nunca se copia de la factura: si las monedas difieren, los
+   * montos no son comparables y el veredicto debe degradar a UNCERTAIN.
+   */
+  supportCurrency: z.string(),
   /** Ítems transcritos del respaldo. El código los compara, no el modelo. */
   supportItems: z.array(LineItemSchema),
   discrepancies: z.array(DiscrepancyReportSchema),
@@ -86,6 +122,18 @@ export const AuditResultSchema = z.object({
 })
 
 export type AuditResult = z.infer<typeof AuditResultSchema>
+
+/**
+ * Resultado de auditoría YA verificado por el código determinista. Además de
+ * los códigos por discrepancia, lleva el motivo del veredicto en sí: los
+ * UNCERTAIN también explican por qué, sin re-preguntarle al modelo. La
+ * `confidence` del modelo sigue siendo cosmética: se muestra, pero jamás
+ * participa de ninguna decisión.
+ */
+export type VerifiedAudit = AuditResult & {
+  /** Motivo principal del veredicto; `null` cuando es MATCH. */
+  reasonCode: ReasonCode | null
+}
 
 // ---------------------------------------------------------------------------
 // Resultado del pipeline
@@ -109,8 +157,8 @@ export interface ReconciliationVerdict {
   status: PipelineStatus
   /** Datos extraídos; `null` si la extracción falló. */
   invoice: InvoiceData | null
-  /** Veredicto de auditoría; `null` si nunca se llegó a auditar. */
-  audit: AuditResult | null
+  /** Veredicto ya verificado por el código; `null` si nunca se llegó a auditar. */
+  audit: VerifiedAudit | null
   /** Documento de respaldo recuperado por RAG, si hubo alguno. */
   matchedSupportDoc: string | null
   /** Score de similitud de la búsqueda RAG. */

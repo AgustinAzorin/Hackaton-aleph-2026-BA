@@ -170,7 +170,15 @@ function renderRow(row, index) {
     row.status === 'ERROR'
       ? (row.error ?? 'Motivo desconocido.')
       : (row.audit?.summary ?? 'Sin veredicto.')
-  tdFile.appendChild(node('span', 'reason', reason))
+  const reasonLine = node('span', 'reason')
+  // Código de motivo estructurado: la respuesta a "¿por qué decidió esto?"
+  // sin re-preguntarle al modelo. Es texto del verificador determinista, pero
+  // igual entra por textContent como todo lo demás.
+  if (row.audit?.reasonCode) {
+    reasonLine.appendChild(node('span', 'reason-code', row.audit.reasonCode))
+  }
+  reasonLine.appendChild(document.createTextNode(reason))
+  tdFile.appendChild(reasonLine)
   tr.appendChild(tdFile)
 
   // Proveedor y total
@@ -220,7 +228,7 @@ function renderRow(row, index) {
       values.appendChild(node('span', 'sup', d.supportValue))
       box.appendChild(values)
 
-      box.appendChild(node('span'))
+      box.appendChild(node('span', 'diff-code', d.reasonCode ?? ''))
       box.appendChild(node('span', 'diff-note', d.difference))
       grid.appendChild(box)
     }
