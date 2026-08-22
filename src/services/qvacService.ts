@@ -49,6 +49,7 @@ import {
 } from '../types.js'
 import { missingCriticalFields, normalizeEvidence, normalizeInvoice } from './normalize.js'
 import { isSupportedDocument, toImagePages } from './rasterize.js'
+import { resolvePoEvidence } from './retrieval.js'
 
 // ---------------------------------------------------------------------------
 // Progreso
@@ -827,9 +828,21 @@ function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n[...texto truncado...]`
 }
 
+/**
+ * De dónde salió la evidencia de una factura. `exact` lleva el texto OCR
+ * completo del respaldo (no un fragmento RAG): la coincidencia de PO ya
+ * identificó el documento, y el auditor debe verlo entero. `po-not-found`
+ * significa que la factura cita una orden que NO existe en el conjunto de
+ * respaldos: no hay nada que auditar y el veredicto se decide sin modelo.
+ */
+export type EvidenceSource =
+  | { kind: 'exact'; file: string; text: string; citedPo: string }
+  | { kind: 'semantic'; hits: RagSearchResult[] }
+  | { kind: 'po-not-found'; citedPo: string }
+
 export interface AuditInput {
   ocr: OcrDocumentResult
-  hits: RagSearchResult[]
+  evidence: EvidenceSource
 }
 
 /**
@@ -917,17 +930,62 @@ export async function extractAndAudit(
         }
 
         const invoice = extraction.data
-        const best = input.hits[0] ?? null
-        // El id que devuelve la búsqueda es un UUID interno, inservible para un
-        // auditor. El nombre real del archivo viaja como prefijo del contenido,
-        // que es justamente para lo que se antepuso al indexar.
-        const bestLabel = best !== null ? (supportLabel(best.content) ?? best.id) : null
-        const supportContext =
-          input.hits.length > 0
-            ? input.hits
-                .map((hit, i) => `--- Respaldo ${i + 1} (score ${hit.score.toFixed(3)}) ---\n${hit.content}`)
-                .join('\n\n')
-            : 'NO SE RECUPERÓ NINGÚN DOCUMENTO DE RESPALDO.'
+
+        // La factura cita una orden de compra que NO existe en el conjunto de
+        // respaldos. Eso es un hecho establecido por búsqueda exacta, no una
+        // impresión: el veredicto se decide acá, sin llamar al modelo. Caer a
+        // la búsqueda semántica "a ver si hay algo parecido" sólo puede traer
+        // un PO ajeno y fabricar acusaciones falsas.
+        if (input.evidence.kind === 'po-not-found') {
+          verdicts.push({
+            file: name,
+            status: 'OK',
+            invoice,
+            audit: {
+              supportDocumentId: '',
+              supportVendorName: '',
+              supportTotalAmount: 0,
+              supportCurrency: '',
+              supportItems: [],
+              discrepancies: [],
+              verdict: 'UNCERTAIN',
+              confidence: 0.3,
+              summary: `La factura cita ${input.evidence.citedPo} pero esa orden no aparece en ningún documento de respaldo; la factura puede carecer de respaldo real.`
+            },
+            matchedSupportDoc: null,
+            supportScore: null,
+            error: null,
+            timings,
+            totalMs: now() - startedAll
+          })
+          continue
+        }
+
+        let bestLabel: string | null
+        let supportScore: number | null
+        let supportContext: string
+
+        if (input.evidence.kind === 'exact') {
+          // Evidencia resuelta por PO exacto: el documento entero, no un
+          // fragmento. El score semántico no aplica (no hubo búsqueda).
+          bestLabel = path.basename(input.evidence.file)
+          supportScore = null
+          supportContext = `--- Respaldo (coincidencia exacta de PO ${input.evidence.citedPo}) ---\n[${bestLabel}]\n${input.evidence.text}`
+        } else {
+          const hits = input.evidence.hits
+          const best = hits[0] ?? null
+          // El id que devuelve la búsqueda es un UUID interno, inservible para
+          // un auditor. El nombre real del archivo viaja como prefijo del
+          // contenido, que es justamente para lo que se antepuso al indexar.
+          bestLabel = best !== null ? (supportLabel(best.content) ?? best.id) : null
+          supportScore = best?.score ?? null
+          supportContext =
+            hits.length > 0
+              ? hits
+                  .map((hit, i) => `--- Respaldo ${i + 1} (score ${hit.score.toFixed(3)}) ---\n${hit.content}`)
+                  .join('\n\n')
+              : 'NO SE RECUPERÓ NINGÚN DOCUMENTO DE RESPALDO.'
+        }
 
         // --- Auditoría ------------------------------------------------------
         onProgress({
@@ -980,7 +1038,7 @@ export async function extractAndAudit(
               summary: `El modelo de auditoría no produjo un veredicto válido: ${audit.error}`
             },
             matchedSupportDoc: bestLabel,
-            supportScore: best?.score ?? null,
+            supportScore,
             error: audit.error,
             timings,
             totalMs: now() - startedAll
@@ -992,9 +1050,9 @@ export async function extractAndAudit(
           file: name,
           status: 'OK',
           invoice,
-          audit: verifyAgainstEvidence(invoice, audit.data, best?.score ?? null),
+          audit: verifyAgainstEvidence(invoice, audit.data, supportScore),
           matchedSupportDoc: bestLabel,
-          supportScore: best?.score ?? null,
+          supportScore,
           error: null,
           timings,
           totalMs: now() - startedAll
@@ -1040,25 +1098,79 @@ export async function reconcileFolders(options: ReconcileOptions): Promise<Recon
   const supportOcr = allOcr.slice(0, supportFiles.length)
   const invoiceOcr = allOcr.slice(supportFiles.length)
 
-  // Fase 2: embeddings + recuperación, y el modelo se descarga al salir.
-  onProgress({ stage: 'index', message: 'Fase 2/3 — Indexación RAG y recuperación' })
-  let retrieved = new Map<string, RagSearchResult[]>()
-  try {
-    const result = await indexSupportDocuments(supportOcr, invoiceOcr, workspace, onProgress)
-    retrieved = result.retrieved
-  } catch (error) {
-    // Sin RAG el pipeline sigue: las facturas quedan sin evidencia y la
-    // auditoría las marcará UNCERTAIN, que es el comportamiento honesto.
+  // Fase 2a: resolución EXACTA de PO. Es puro trabajo de strings sobre los
+  // resultados de OCR — corre sin ningún modelo cargado, así que no le cuesta
+  // nada al presupuesto de memoria. Una factura que cita un PO se resuelve por
+  // identificador; la búsqueda semántica queda sólo para las que no citan
+  // ninguno. La estrategia completa está documentada en retrieval.ts.
+  onProgress({ stage: 'index', message: 'Fase 2/3 — Resolución de respaldos (PO exacto primero)' })
+  const lookupDocs = supportOcr
+    .filter((d) => d.error === null && d.text.length > 0)
+    .map((d) => ({ file: d.file, text: d.text }))
+  const evidenceByFile = new Map<string, EvidenceSource>()
+  const semanticOcr: OcrDocumentResult[] = []
+
+  for (const inv of invoiceOcr) {
+    if (inv.error !== null || inv.text.length === 0) {
+      evidenceByFile.set(inv.file, { kind: 'semantic', hits: [] })
+      continue
+    }
+    const resolution = resolvePoEvidence(inv.text, lookupDocs)
+    if (resolution.kind === 'exact') {
+      onProgress({
+        stage: 'index',
+        message: `${path.basename(inv.file)} → ${path.basename(resolution.doc.file)} (PO exacto ${resolution.citedPo}).`
+      })
+      evidenceByFile.set(inv.file, {
+        kind: 'exact',
+        file: resolution.doc.file,
+        text: resolution.doc.text,
+        citedPo: resolution.citedPo
+      })
+    } else if (resolution.kind === 'not-found') {
+      onProgress({
+        stage: 'index',
+        message: `${path.basename(inv.file)} cita ${resolution.citedPo}, ausente de los respaldos.`
+      })
+      evidenceByFile.set(inv.file, { kind: 'po-not-found', citedPo: resolution.citedPo })
+    } else {
+      semanticOcr.push(inv)
+    }
+  }
+
+  // Fase 2b: embeddings + recuperación semántica, sólo si alguna factura no
+  // citó PO. El modelo se descarga al salir.
+  if (semanticOcr.length > 0) {
+    try {
+      const result = await indexSupportDocuments(supportOcr, semanticOcr, workspace, onProgress)
+      for (const inv of semanticOcr) {
+        evidenceByFile.set(inv.file, { kind: 'semantic', hits: result.retrieved.get(inv.file) ?? [] })
+      }
+    } catch (error) {
+      // Sin RAG el pipeline sigue: las facturas quedan sin evidencia y la
+      // auditoría las marcará UNCERTAIN, que es el comportamiento honesto.
+      onProgress({
+        stage: 'index',
+        message: `La indexación RAG falló (${error instanceof Error ? error.message : String(error)}); se continúa sin evidencia de respaldo.`
+      })
+      for (const inv of semanticOcr) {
+        if (!evidenceByFile.has(inv.file)) evidenceByFile.set(inv.file, { kind: 'semantic', hits: [] })
+      }
+    }
+  } else {
     onProgress({
       stage: 'index',
-      message: `La indexación RAG falló (${error instanceof Error ? error.message : String(error)}); se continúa sin evidencia de respaldo.`
+      message: 'Todas las facturas se resolvieron por PO exacto; no hace falta búsqueda semántica.'
     })
   }
 
   // Fase 3: el LLM entra en memoria recién ahora.
   onProgress({ stage: 'extract', message: 'Fase 3/3 — Extracción estructurada y auditoría' })
   const verdicts = await extractAndAudit(
-    invoiceOcr.map((entry) => ({ ocr: entry, hits: retrieved.get(entry.file) ?? [] })),
+    invoiceOcr.map((entry) => ({
+      ocr: entry,
+      evidence: evidenceByFile.get(entry.file) ?? { kind: 'semantic', hits: [] }
+    })),
     onProgress
   )
 

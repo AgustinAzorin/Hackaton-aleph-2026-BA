@@ -101,6 +101,18 @@ El pipeline corre en **tres fases secuenciales, con un solo modelo grande vivo p
 
 Por eso la búsqueda RAG ocurre en la fase 2 y no dentro de la auditoría: recuperar durante la fase 3 exigiría tener el modelo de embeddings y el LLM cargados al mismo tiempo, que es exactamente lo que el presupuesto de memoria prohíbe.
 
+### Recuperación híbrida: PO exacto primero, semántica como último recurso
+
+Cuando una factura cita explícitamente una orden de compra ("PO Reference: PO-5003"), buscarla por similitud semántica es usar la herramienta equivocada: un embedding puede traer con score alto una orden *parecida* pero ajena, y comparar contra el documento equivocado produce acusaciones falsas. Una cita es un identificador, y los identificadores se resuelven por igualdad.
+
+La fase 2 resuelve la evidencia en este orden ([`src/services/retrieval.ts`](src/services/retrieval.ts)):
+
+1. **Coincidencia exacta.** Si la factura cita un PO, se lo busca — normalizado por mayúsculas, guiones y espacios — contra los nombres de archivo de los respaldos y contra los números de PO que aparecen en su texto OCR. Si aparece, **ese documento es la evidencia**, y a la auditoría le llega su texto OCR completo, no un fragmento RAG. Este paso es puro trabajo de strings sobre OCR ya calculado: corre sin ningún modelo cargado y no le cuesta nada al presupuesto de memoria.
+2. **PO citado pero ausente.** Si la orden citada no aparece en *ningún* respaldo, la factura queda `UNCERTAIN` con motivo `PO_NOT_FOUND`: puede carecer de respaldo real, y el reporte lo dice. Deliberadamente **no** se cae a la búsqueda semántica "a ver si hay algo parecido" — un PO parecido pero equivocado es peor que ningún PO.
+3. **Sin PO citado.** Recién ahí entra la búsqueda semántica de siempre (top-3), con las salvaguardas existentes de proveedor y score mínimo de recuperación.
+
+Si todas las facturas del lote citan un PO resoluble, el modelo de embeddings ni siquiera se carga.
+
 **La ruta principal es OCR → texto plano → LLM de texto.** No depende de que entre un modelo multimodal en memoria; el multimodal queda como mejora opcional, no como requisito.
 
 ### El modelo transcribe, el código compara

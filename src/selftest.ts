@@ -27,6 +27,7 @@ import {
   normalizeInvoice,
   normalizeText
 } from './services/normalize.js'
+import { canonicalPo, findCitedPo, resolvePoEvidence } from './services/retrieval.js'
 import {
   AUDIT_JSON_SCHEMA,
   AuditResultSchema,
@@ -634,6 +635,81 @@ await test('moneda del respaldo ilegible no tapa una discrepancia numérica', ()
   )
   assert.equal(result.verdict, 'DISCREPANCY')
   assert.ok(result.summary.includes('sin verificar'))
+})
+
+// ---------------------------------------------------------------------------
+console.log('\nRecuperación híbrida (PO exacto primero, semántica como último recurso)')
+
+await test('la forma canónica de un PO ignora prefijo, guiones y mayúsculas', () => {
+  assert.equal(canonicalPo('PO-5003'), '5003')
+  assert.equal(canonicalPo('po 5003'), '5003')
+  assert.equal(canonicalPo('PO5003'), '5003')
+  assert.equal(canonicalPo('5003'), '5003')
+  assert.equal(canonicalPo('PO-AB-123'), 'AB123')
+})
+
+await test('encuentra el PO citado en el texto OCR de una factura', () => {
+  const cited = findCitedPo('INVOICE\nCedar Hardware Supply\nInvoice Number: INV-1004\nPO Reference: PO-5004\nDate: 2026-07-24')
+  assert.ok(cited !== null, 'no encontró la cita')
+  assert.equal(cited.canonical, '5004')
+})
+
+await test('"P.O. Box" de una dirección no se confunde con una cita de PO', () => {
+  assert.equal(findCitedPo('Acme LLC\nP.O. Box Newark NJ\nInvoice INV-9'), null)
+  assert.equal(findCitedPo('factura sin ninguna referencia'), null)
+})
+
+const supportSet = [
+  { file: '/support/PO-5001.pdf', text: 'PURCHASE ORDER\nAcme Office Supplies LLC\nPO Number: PO-5001\nTOTAL USD 1,840.00' },
+  { file: '/support/PO-5003.pdf', text: 'PURCHASE ORDER\nNorthwind Logistics Inc.\nPO Number: PO-5003\nTOTAL USD 4,200.00' },
+  { file: '/support/orden_julio.pdf', text: 'PURCHASE ORDER\nBolt & Nut Co.\nPO Number: PO-7788\nTOTAL USD 900.00' }
+]
+
+await test('un PO citado se resuelve exacto contra el nombre de archivo', () => {
+  const result = resolvePoEvidence('INVOICE\nAcme\nPO Reference: PO-5001\nTOTAL 1840', supportSet)
+  assert.equal(result.kind, 'exact')
+  assert.ok(result.kind === 'exact' && result.doc.file.endsWith('PO-5001.pdf'))
+})
+
+await test('un PO citado se resuelve exacto contra el texto OCR aunque el archivo tenga otro nombre', () => {
+  const result = resolvePoEvidence('INVOICE\nBolt & Nut Co.\nPO Reference: PO-7788', supportSet)
+  assert.equal(result.kind, 'exact')
+  assert.ok(result.kind === 'exact' && result.doc.file.endsWith('orden_julio.pdf'))
+})
+
+await test('un PO citado ausente del conjunto ENTERO da not-found, nunca "algo parecido"', () => {
+  // El conjunto contiene órdenes muy similares en contenido; nada de eso
+  // importa: la cita es un identificador y el identificador no está.
+  const result = resolvePoEvidence('INVOICE\nNorthwind Logistics Inc.\nPO Reference: PO-5099\nContainer drayage, port to warehouse', supportSet)
+  assert.equal(result.kind, 'not-found')
+  assert.ok(result.kind === 'not-found' && result.citedPo.includes('5099'))
+})
+
+await test('sin PO citado la resolución delega en la búsqueda semántica', () => {
+  const result = resolvePoEvidence('INVOICE\nQuantum Freight Systems\nExpedited air freight', supportSet)
+  assert.equal(result.kind, 'no-po')
+})
+
+await test('con dos respaldos de contenido casi idéntico gana el del PO citado', () => {
+  const twins = [
+    { file: '/support/PO-9001.pdf', text: 'PURCHASE ORDER\nAcme LLC\nPO Number: PO-9001\nWidget A 10 x 5.00\nTOTAL USD 50.00' },
+    { file: '/support/PO-9002.pdf', text: 'PURCHASE ORDER\nAcme LLC\nPO Number: PO-9002\nWidget A 10 x 5.00\nTOTAL USD 50.00' }
+  ]
+  const result = resolvePoEvidence('INVOICE\nAcme LLC\nPO Reference: PO-9002', twins)
+  assert.equal(result.kind, 'exact')
+  assert.ok(result.kind === 'exact' && result.doc.file.endsWith('PO-9002.pdf'))
+})
+
+await test('el verificador rechaza un respaldo de PO equivocado aunque la similitud sea alta', () => {
+  // Cinturón y tiradores: si a pesar de todo llegara un respaldo ajeno con
+  // score semántico alto, la referencia citada sigue mandando.
+  const result = verifyAgainstEvidence(
+    invoiceOf('Northwind Logistics Inc.', 'PO-5099', 4620, []),
+    supportOf('PO-5003.pdf', 'Northwind Logistics Inc.', 4200, []),
+    0.95
+  )
+  assert.equal(result.verdict, 'UNCERTAIN')
+  assert.deepEqual(result.discrepancies, [])
 })
 
 // ---------------------------------------------------------------------------
